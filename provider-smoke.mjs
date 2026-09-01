@@ -23,13 +23,19 @@ try {
       res.writeHead(403, { "content-type": "text/html; charset=utf-8" });
       return res.end("<html><body>access denied</body></html>");
     }
-    if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+    if (req.method !== "POST" || !["/v1/chat/completions", "/strict/chat/completions"].includes(req.url)) {
       res.writeHead(404); return res.end();
     }
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     upstreamCalls.push({ authorization: req.headers.authorization, body: requestBody });
+    if (req.url === "/strict/chat/completions" && (Object.hasOwn(requestBody, "enable_thinking") || Object.hasOwn(requestBody, "thinking"))) {
+      const field = Object.hasOwn(requestBody, "enable_thinking") ? "enable_thinking" : "thinking";
+      const body = JSON.stringify({ error: { message: `Unrecognized request argument supplied: ${field}` } });
+      res.writeHead(400, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+      return res.end(body);
+    }
     const requestedTool = requestBody.tool_choice?.function?.name;
     const message = requestedTool
       ? { role: "assistant", content: null, tool_calls: [{ id: "call_probe", type: "function", function: { name: requestedTool, arguments: JSON.stringify({ ok: true }) } }] }
@@ -67,15 +73,21 @@ try {
   assert.equal(providerProbe.status, 200, JSON.stringify(providerProbe.data));
   assert.equal(providerProbe.data.model, "fake-model");
   assert.equal(providerProbe.data.protocol, "chat_completions_tool_call");
+  assert.equal(providerProbe.data.non_thinking_mode, "enable_thinking_false");
   assert.equal(upstreamCalls[0].body.tool_choice.function.name, "vivant_valley_probe");
+  assert.equal(upstreamCalls[0].body.enable_thinking, false);
+  assert.ok(!Object.hasOwn(upstreamCalls[0].body, "thinking"));
   const route = await request("/api/v1/admin/models/vv-dialogue", { method: "PATCH", cookies: admin.cookies, csrf: adminCsrf, body: { providerId: provider.data.id, providerModel: "fake-model" } });
   assert.equal(route.status, 200);
-  const completion = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}` }, body: { model: "vv-dialogue", messages: [{ role: "user", content: "hello" }], max_tokens: 64 } });
+  const completion = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}` }, body: { model: "vv-dialogue", messages: [{ role: "user", content: "hello" }], max_tokens: 64, thinking: { type: "enabled" }, reasoning_effort: "high", enable_thinking: true } });
   assert.equal(completion.status, 200, JSON.stringify(completion.data));
   assert.equal(completion.data.choices[0].message.content, "provider-ok");
   assert.equal(upstreamCalls.length, 2);
   assert.equal(upstreamCalls[1].authorization, "Bearer fake-provider-secret");
   assert.equal(upstreamCalls[1].body.model, "fake-model");
+  assert.equal(upstreamCalls[1].body.enable_thinking, false);
+  assert.ok(!Object.hasOwn(upstreamCalls[1].body, "thinking"));
+  assert.ok(!Object.hasOwn(upstreamCalls[1].body, "reasoning_effort"));
 
   const badProvider = await request("/api/v1/admin/providers", { method: "POST", cookies: admin.cookies, csrf: adminCsrf, body: { name: "HTML error upstream", base_url: `http://127.0.0.1:${upstreamPort}/bad`, default_model: "fake-model", api_key: "fake-provider-secret" } });
   assert.equal(badProvider.status, 201);
@@ -91,6 +103,17 @@ try {
   assert.equal(badCompletion.data.error.code, "invalid_upstream_response");
   assert.match(badCompletion.data.error.message, /HTTP 403/);
   assert.match(badCompletion.data.error.message, /text\/html/);
+
+  const strictProvider = await request("/api/v1/admin/providers", { method: "POST", cookies: admin.cookies, csrf: adminCsrf, body: { name: "Strict OpenAI upstream", base_url: `http://127.0.0.1:${upstreamPort}/strict`, default_model: "fake-model", api_key: "fake-provider-secret" } });
+  assert.equal(strictProvider.status, 201);
+  const strictProbe = await request(`/api/v1/admin/providers/${strictProvider.data.id}/test`, { method: "POST", cookies: admin.cookies, csrf: adminCsrf });
+  assert.equal(strictProbe.status, 200, JSON.stringify(strictProbe.data));
+  assert.equal(strictProbe.data.non_thinking_mode, "omit");
+  const strictCalls = upstreamCalls.filter((value) => value.body.messages?.[0]?.content === "Call vivant_valley_probe with ok=true.").slice(-3);
+  assert.equal(strictCalls[0].body.enable_thinking, false);
+  assert.equal(strictCalls[1].body.thinking.type, "disabled");
+  assert.ok(!Object.hasOwn(strictCalls[2].body, "enable_thinking"));
+  assert.ok(!Object.hasOwn(strictCalls[2].body, "thinking"));
   console.log("managed provider routing smoke checks passed");
 } catch (error) {
   console.error(error);

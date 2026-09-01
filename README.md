@@ -109,6 +109,10 @@ POST   /api/v1/admin/providers/{id}/test  # small real tool-call compatibility p
 DELETE /api/v1/admin/providers/{id}
 ```
 
+Hosted requests default to non-thinking mode. The gateway removes client-side
+thinking options and negotiates a compatible disabled form with each upstream
+before falling back to a standard OpenAI request that omits vendor fields.
+
 The administrator can switch runtime traffic between Demo and real upstreams
 from the `/admin` page. The setting is persisted in the database, so no SSH or
 `.env` edit is needed for routine switching:

@@ -36,6 +36,7 @@ if (!config.adminPagePassword) {
 const rateBuckets = new Map();
 const activeRequests = new Map();
 const adminGateAttempts = new Map();
+const upstreamNonThinkingModes = new Map();
 const startedAt = Date.now();
 let db = loadDatabase();
 seedDatabase();
@@ -283,6 +284,51 @@ function demoModeEnabled() {
   return Boolean(db.settings.demoMode);
 }
 
+function withNonThinkingMode(payload, mode) {
+  const result = { ...payload };
+  delete result.thinking;
+  delete result.reasoning_effort;
+  delete result.enable_thinking;
+  if (mode === "enable_thinking_false") result.enable_thinking = false;
+  if (mode === "thinking_disabled") result.thinking = { type: "disabled" };
+  return result;
+}
+
+function canRetryNonThinkingMode(response, parsed) {
+  if (response.status !== 400 && response.status !== 422) return false;
+  const errorText = JSON.stringify(parsed?.error || parsed || "").toLowerCase();
+  return errorText.includes("thinking");
+}
+
+async function postNonThinkingCompletion(endpoint, apiKey, payload, extraHeaders, signal) {
+  const endpointKey = `${String(endpoint)}\n${String(payload.model || "")}`;
+  const supportedModes = ["enable_thinking_false", "thinking_disabled", "omit"];
+  const cachedMode = upstreamNonThinkingModes.get(endpointKey);
+  const modes = cachedMode
+    ? [cachedMode, ...supportedModes.filter((value) => value !== cachedMode)]
+    : supportedModes;
+  let lastResult;
+  for (const mode of modes) {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiKey}`, accept: "application/json", "content-type": "application/json", ...extraHeaders },
+      body: JSON.stringify(withNonThinkingMode(payload, mode)),
+      signal,
+    });
+    const text = await response.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch {}
+    const result = { response, text, parsed, mode };
+    if (response.ok) {
+      upstreamNonThinkingModes.set(endpointKey, mode);
+      return result;
+    }
+    lastResult = result;
+    if (!canRetryNonThinkingMode(response, parsed)) break;
+  }
+  return lastResult;
+}
+
 async function probeProvider(provider) {
   let endpoint;
   try { endpoint = resolveEndpoint(provider.baseUrl); } catch { throw httpError(400, "上游地址无效。", "invalid_provider_url"); }
@@ -315,15 +361,9 @@ async function probeProvider(provider) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.min(config.requestTimeoutMs, 15_000));
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { authorization: `Bearer ${apiKey}`, accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const text = await response.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { throw invalidUpstreamJsonError(response, "provider_check_invalid_response"); }
+    const result = await postNonThinkingCompletion(endpoint, apiKey, payload, {}, controller.signal);
+    const { response, text, parsed } = result;
+    if (parsed === undefined) throw invalidUpstreamJsonError(response, "provider_check_invalid_response");
     if (!response.ok) throw httpError(502, `上游返回 HTTP ${response.status}：${upstreamErrorMessage(parsed, "模型调用失败。")}`, "provider_check_failed", "upstream_error");
     const message = parsed?.choices?.[0]?.message;
     const call = Array.isArray(message?.tool_calls)
@@ -334,7 +374,7 @@ async function probeProvider(provider) {
     let argumentsValue;
     try { argumentsValue = typeof rawArguments === "string" ? JSON.parse(rawArguments) : rawArguments; } catch { throw httpError(502, "上游工具调用 arguments 不是有效 JSON。", "provider_tool_arguments_invalid", "upstream_error"); }
     if (!argumentsValue || argumentsValue.ok !== true) throw httpError(502, "上游工具调用没有返回有效的探测参数。", "provider_tool_arguments_invalid", "upstream_error");
-    return { status: response.status, bodyBytes: Buffer.byteLength(text), model, protocol: "chat_completions_tool_call" };
+    return { status: response.status, bodyBytes: Buffer.byteLength(text), model, protocol: "chat_completions_tool_call", nonThinkingMode: result.mode };
   } catch (error) {
     if (error.status) throw error;
     throw httpError(error.name === "AbortError" ? 408 : 502, error.name === "AbortError" ? "上游检测超时。" : "无法连接上游。", error.name === "AbortError" ? "provider_check_timeout" : "provider_unreachable", "upstream_error");
@@ -670,10 +710,9 @@ async function upstreamCompletion(body, alias, requestIdValue) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
   try {
-    const response = await fetch(upstream.endpoint, { method: "POST", headers: { authorization: `Bearer ${upstream.apiKey}`, accept: "application/json", "content-type": "application/json", "x-request-id": requestIdValue }, body: JSON.stringify(payload), signal: controller.signal });
-    const text = await response.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { throw invalidUpstreamJsonError(response); }
+    const result = await postNonThinkingCompletion(upstream.endpoint, upstream.apiKey, payload, { "x-request-id": requestIdValue }, controller.signal);
+    const { response, parsed } = result;
+    if (parsed === undefined) throw invalidUpstreamJsonError(response);
     if (!response.ok) throw httpError(response.status === 429 ? 429 : 502, `上游返回 HTTP ${response.status}：${upstreamErrorMessage(parsed, "模型请求失败。")}`, response.status === 429 ? "upstream_rate_limited" : "upstream_error", "upstream_error");
     return normalizeResponse(parsed, alias, requestIdValue);
   } catch (error) {
@@ -963,7 +1002,7 @@ async function adminApi(req, res, url) {
     try {
       const result = await probeProvider(provider);
       provider.lastCheckedAt = now(); provider.lastCheckStatus = "ok"; provider.updatedAt = now(); persistDatabase();
-      return sendJson(res, 200, { ok: true, status: result.status, body_bytes: result.bodyBytes, model: result.model, protocol: result.protocol, checked_at: provider.lastCheckedAt });
+      return sendJson(res, 200, { ok: true, status: result.status, body_bytes: result.bodyBytes, model: result.model, protocol: result.protocol, non_thinking_mode: result.nonThinkingMode, checked_at: provider.lastCheckedAt });
     } catch (error) {
       provider.lastCheckedAt = now(); provider.lastCheckStatus = "failed"; provider.updatedAt = now(); persistDatabase(); throw error;
     }

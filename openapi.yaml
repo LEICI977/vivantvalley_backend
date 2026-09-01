@@ -1247,9 +1247,16 @@ components:
         top_p: { type: number, minimum: 0, maximum: 1 }
         thinking:
           type: object
+          description: Accepted for client compatibility; hosted routing forces non-thinking mode upstream.
           properties: { type: { type: string, enum: [enabled, disabled] } }
           additionalProperties: false
-        reasoning_effort: { type: string, enum: [low, medium, high] }
+        reasoning_effort:
+          type: string
+          enum: [low, medium, high]
+          description: Accepted for client compatibility but ignored while hosted routing is in non-thinking mode.
+        enable_thinking:
+          type: boolean
+          description: Accepted for client compatibility; hosted routing forces this behavior off upstream.
         user: { type: string, maxLength: 128 }
       additionalProperties: false
     ChatCompletion:
