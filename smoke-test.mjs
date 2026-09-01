@@ -75,6 +75,9 @@ try {
   const openAdminPage = await request("/admin", { cookies: adminAccess.cookies, raw: true });
   assert.equal(openAdminPage.status, 200);
   assert.match(openAdminPage.text, /data-card-denomination/);
+  const adminInlineScripts = openAdminPage.text.split("<script>").slice(1).map((part) => part.split("</script>")[0]);
+  assert.ok(adminInlineScripts.length >= 3);
+  adminInlineScripts.forEach((script) => assert.doesNotThrow(() => new Function(script)));
   assert.match(openAdminPage.text, /管理员控制台/);
   const runtimeBefore = await request("/api/v1/admin/settings/runtime", { cookies: adminAccess.cookies });
   assert.equal(runtimeBefore.status, 200);
