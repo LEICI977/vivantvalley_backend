@@ -1,0 +1,13 @@
+{
+	email admin@vivantvalley.com.cn
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+www.vivantvalley.com.cn {
+	encode gzip
+	reverse_proxy 127.0.0.1:8787
+}
+
+http://vivantvalley.com.cn {
+	redir https://www.vivantvalley.com.cn{uri} permanent
+}

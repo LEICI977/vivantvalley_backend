@@ -1,0 +1,16 @@
+{
+  "name": "vivant-valley-hosted-backend",
+  "version": "0.1.0-demo",
+  "private": true,
+  "type": "module",
+  "description": "Vivant Valley hosted AI service demo with user and admin consoles",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "smoke": "node smoke-test.mjs",
+    "smoke:providers": "node provider-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

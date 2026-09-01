@@ -1,0 +1,19 @@
+[Unit]
+Description=Vivant Valley hosted backend demo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/vivantvalley_backend
+EnvironmentFile=/home/ubuntu/vivantvalley_backend/.env
+ExecStart=/usr/bin/node /home/ubuntu/vivantvalley_backend/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

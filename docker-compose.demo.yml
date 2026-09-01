@@ -1,0 +1,15 @@
+services:
+  vivant-valley:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - vivant-valley-data:/app/data
+
+volumes:
+  vivant-valley-data:

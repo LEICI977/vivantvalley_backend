@@ -1,0 +1,18 @@
+[Unit]
+Description=Temporary HTTPS tunnel for Vivant Valley demo
+After=network-online.target vivantvalley-backend.service
+Wants=network-online.target
+Requires=vivantvalley-backend.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8787
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
