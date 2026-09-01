@@ -27,6 +27,8 @@ const config = {
 const CARD_VALUE_MICROS_PER_YUAN = 1_000_000;
 const CARD_BATCH_COUNT = 100;
 const CARD_DENOMINATIONS_YUAN = new Set([1, 5, 10, 20]);
+const PRICING_VERSION = 2;
+const TOTAL_TOKEN_MICROS_PER_1K = 1_000;
 
 if (config.pepper === "demo-pepper-change-me") {
   console.warn("WARNING: BACKEND_PEPPER is using the demo value; change it before production use.");
@@ -162,7 +164,7 @@ function emptyDatabase() {
     redeemBatches: [],
     providers: [],
     modelAliases: [],
-    settings: { invitationRequired: config.invitationRequired, demoMode: config.demoMode },
+    settings: { invitationRequired: config.invitationRequired, demoMode: config.demoMode, pricingVersion: 0 },
   };
 }
 
@@ -190,13 +192,33 @@ function persistDatabase() {
 function seedDatabase() {
   if (!db.modelAliases.length) {
     db.modelAliases = [
-      { alias: "vv-dialogue", providerId: null, providerModel: config.upstreamModel, enabled: true, maxInputTokens: 16_000, maxOutputTokens: 2_048, inputMicrosPer1k: 1_400, outputMicrosPer1k: 2_800, cachedInputMicrosPer1k: 350 },
-      { alias: "vv-fast", providerId: null, providerModel: config.upstreamModel, enabled: true, maxInputTokens: 8_000, maxOutputTokens: 1_024, inputMicrosPer1k: 700, outputMicrosPer1k: 1_400, cachedInputMicrosPer1k: 175 },
+      { alias: "vv-dialogue", providerId: null, providerModel: config.upstreamModel, enabled: true, maxInputTokens: 16_000, maxOutputTokens: 2_048, inputMicrosPer1k: TOTAL_TOKEN_MICROS_PER_1K, outputMicrosPer1k: TOTAL_TOKEN_MICROS_PER_1K, cachedInputMicrosPer1k: TOTAL_TOKEN_MICROS_PER_1K },
+      { alias: "vv-fast", providerId: null, providerModel: config.upstreamModel, enabled: true, maxInputTokens: 8_000, maxOutputTokens: 1_024, inputMicrosPer1k: TOTAL_TOKEN_MICROS_PER_1K, outputMicrosPer1k: TOTAL_TOKEN_MICROS_PER_1K, cachedInputMicrosPer1k: TOTAL_TOKEN_MICROS_PER_1K },
     ];
   }
   for (const model of db.modelAliases) if (!Object.hasOwn(model, "providerId")) model.providerId = null;
   db.settings.invitationRequired = Boolean(db.settings.invitationRequired);
   db.settings.demoMode = Boolean(db.settings.demoMode);
+  // Migrate only the prices shipped by the service. Values changed by an
+  // administrator are left untouched.
+  if (Number(db.settings.pricingVersion || 0) < PRICING_VERSION) {
+    for (const model of db.modelAliases) {
+      const shippedDefault = model.alias === "vv-dialogue"
+        ? [1_400, 2_800, 350]
+        : model.alias === "vv-fast"
+          ? [700, 1_400, 175]
+          : null;
+      if (shippedDefault
+        && model.inputMicrosPer1k === shippedDefault[0]
+        && model.outputMicrosPer1k === shippedDefault[1]
+        && model.cachedInputMicrosPer1k === shippedDefault[2]) {
+        model.inputMicrosPer1k = TOTAL_TOKEN_MICROS_PER_1K;
+        model.outputMicrosPer1k = TOTAL_TOKEN_MICROS_PER_1K;
+        model.cachedInputMicrosPer1k = TOTAL_TOKEN_MICROS_PER_1K;
+      }
+    }
+    db.settings.pricingVersion = PRICING_VERSION;
+  }
   const adminEmail = (process.env.ADMIN_EMAIL || "admin@example.com").trim().toLowerCase();
   if (!db.users.some((user) => user.email === adminEmail)) {
     const admin = { id: id(), email: adminEmail, passwordHash: passwordHash(process.env.ADMIN_PASSWORD || "change-this-admin-password"), role: "admin", status: "active", createdAt: now(), lastLoginAt: null };
@@ -577,7 +599,23 @@ function httpError(status, message, code, type = status === 429 ? "rate_limit_er
 
 function publicUser(user) {
   const wallet = db.wallets.find((value) => value.userId === user.id) || { availableMicros: 0, reservedMicros: 0 };
-  return { id: user.id, email: user.email, role: user.role, status: user.status, created_at: user.createdAt, last_login_at: user.lastLoginAt, wallet: { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" } };
+  return { id: user.id, email: user.email, role: user.role, status: user.status, created_at: user.createdAt, last_login_at: user.lastLoginAt, wallet: publicWallet(wallet) };
+}
+
+function publicWallet(wallet) {
+  const availableMicros = Math.max(0, Number(wallet?.availableMicros) || 0);
+  const reservedMicros = Math.max(0, Number(wallet?.reservedMicros) || 0);
+  return {
+    available_micros: availableMicros,
+    reserved_micros: reservedMicros,
+    // Strings avoid floating-point rounding in clients while remaining easy
+    // to display as a人民币 amount.
+    balance_yuan: (availableMicros / CARD_VALUE_MICROS_PER_YUAN).toFixed(2),
+    reserved_yuan: (reservedMicros / CARD_VALUE_MICROS_PER_YUAN).toFixed(2),
+    currency: "credit_micros",
+    display_currency: "CNY",
+    pricing_rule: "每 1,000,000 Token 收费 1 元",
+  };
 }
 
 function session(req) {
@@ -976,7 +1014,7 @@ async function api(req, res, url) {
         cached_input_micros_per_1k: value.cachedInputMicrosPer1k,
       }));
       const wallet = db.wallets.find((value) => value.userId === current.user.id) || { availableMicros: 0, reservedMicros: 0 };
-      return sendJson(res, 200, { user: publicUser(current.user), base_url: "https://www.vivantvalley.com.cn/v1", models: items, wallet: { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" } });
+      return sendJson(res, 200, { user: publicUser(current.user), base_url: "https://www.vivantvalley.com.cn/v1", models: items, wallet: publicWallet(wallet) });
     }
     if (method === "POST" && pathname === "/api/v1/mod/redeem") {
       const current = requireModSession(req);
@@ -988,15 +1026,15 @@ async function api(req, res, url) {
       wallet.availableMicros += code.valueMicros;
       db.ledger.push({ id: id(), userId: current.user.id, kind: "redeem", amountMicros: code.valueMicros, balanceAfterMicros: wallet.availableMicros, createdAt: now(), metadata: { redeem_code: code.displayPrefix, source: "mod" } });
       persistDatabase();
-      return sendJson(res, 200, { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" });
+      return sendJson(res, 200, publicWallet(wallet));
     }
     if (method === "GET" && pathname === "/api/v1/usage") { const current = requireSession(req, res); if (!current) return; const items = listUsage(current.user.id); return sendJson(res, 200, { items, page: 1, page_size: items.length, total: items.length, totals: { prompt_tokens: items.reduce((sum, value) => sum + value.usage.prompt_tokens, 0), completion_tokens: items.reduce((sum, value) => sum + value.usage.completion_tokens, 0), cost_micros: items.reduce((sum, value) => sum + value.cost_micros, 0) } }); }
-    if (method === "GET" && pathname === "/api/v1/ledger") { const current = requireSession(req, res); if (!current) return; const wallet = db.wallets.find((value) => value.userId === current.user.id); const items = db.ledger.filter((value) => value.userId === current.user.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map((value) => ({ id: value.id, kind: value.kind, amount_micros: value.amountMicros, balance_after_micros: value.balanceAfterMicros, created_at: value.createdAt, request_id: value.requestId || null, note: value.metadata?.reason || null })); return sendJson(res, 200, { wallet: { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" }, items, page: 1, page_size: items.length, total: items.length }); }
+    if (method === "GET" && pathname === "/api/v1/ledger") { const current = requireSession(req, res); if (!current) return; const wallet = db.wallets.find((value) => value.userId === current.user.id); const items = db.ledger.filter((value) => value.userId === current.user.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map((value) => ({ id: value.id, kind: value.kind, amount_micros: value.amountMicros, balance_after_micros: value.balanceAfterMicros, created_at: value.createdAt, request_id: value.requestId || null, note: value.metadata?.reason || null })); return sendJson(res, 200, { wallet: publicWallet(wallet), items, page: 1, page_size: items.length, total: items.length }); }
     if (pathname === "/api/v1/keys" && method === "GET") { const current = requireSession(req, res); if (!current) return; return sendJson(res, 200, { items: db.deviceKeys.filter((value) => value.userId === current.user.id).map((value) => ({ id: value.id, display_prefix: value.displayPrefix, label: value.label, created_at: value.createdAt, last_used_at: value.lastUsedAt, expires_at: value.expiresAt, revoked: Boolean(value.revokedAt) })) }); }
     if (pathname === "/api/v1/keys" && method === "POST") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const body = await readBody(req).catch((error) => error.status ? {} : Promise.reject(error)); const created = createKey(current.user.id, body.label, body.expires_at || null); return sendJson(res, 201, { id: created.record.id, key: created.value, display_prefix: created.record.displayPrefix, label: created.record.label, created_at: created.record.createdAt, last_used_at: null, expires_at: created.record.expiresAt, revoked: false }); }
     const keyMatch = /^\/api\/v1\/keys\/([^/]+)$/.exec(pathname);
     if (keyMatch && method === "DELETE") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const key = db.deviceKeys.find((value) => value.id === keyMatch[1] && value.userId === current.user.id); if (!key) throw httpError(404, "设备 Key 不存在。", "not_found", "not_found_error"); key.revokedAt ||= now(); persistDatabase(); return sendJson(res, 204, null); }
-    if (method === "POST" && pathname === "/api/v1/redeem") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const body = await readBody(req); const code = findRedeemCode(body.code, "credit"); if (!code) throw httpError(409, "兑换码无效、已使用或已过期。", "invalid_redeem_code", "conflict_error"); consumeRedeemCode(code); const wallet = db.wallets.find((value) => value.userId === current.user.id); wallet.availableMicros += code.valueMicros; db.ledger.push({ id: id(), userId: current.user.id, kind: "redeem", amountMicros: code.valueMicros, balanceAfterMicros: wallet.availableMicros, createdAt: now(), metadata: { redeem_code: code.displayPrefix, batch_id: code.batchId || null, denomination_yuan: code.denominationYuan || null } }); persistDatabase(); return sendJson(res, 200, { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros", redeemed_value_micros: code.valueMicros }); }
+    if (method === "POST" && pathname === "/api/v1/redeem") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const body = await readBody(req); const code = findRedeemCode(body.code, "credit"); if (!code) throw httpError(409, "兑换码无效、已使用或已过期。", "invalid_redeem_code", "conflict_error"); consumeRedeemCode(code); const wallet = db.wallets.find((value) => value.userId === current.user.id); wallet.availableMicros += code.valueMicros; db.ledger.push({ id: id(), userId: current.user.id, kind: "redeem", amountMicros: code.valueMicros, balanceAfterMicros: wallet.availableMicros, createdAt: now(), metadata: { redeem_code: code.displayPrefix, batch_id: code.batchId || null, denomination_yuan: code.denominationYuan || null } }); persistDatabase(); return sendJson(res, 200, { ...publicWallet(wallet), redeemed_value_micros: code.valueMicros, redeemed_value_yuan: (code.valueMicros / CARD_VALUE_MICROS_PER_YUAN).toFixed(2) }); }
     if (pathname === "/v1/models" && method === "GET") { const auth = device(req, res); if (!auth) return; return sendJson(res, 200, { object: "list", data: db.modelAliases.filter((value) => value.enabled).map((value) => ({ id: value.alias, object: "model", owned_by: "vivant-valley" })) }); }
     if ((pathname === "/v1/chat/completions" || pathname === "/chat/completions") && method === "POST") return chatCompletion(req, res);
     if (pathname.startsWith("/api/v1/admin/")) {
@@ -1021,7 +1059,7 @@ async function adminApi(req, res, url) {
   const userMatch = /^\/api\/v1\/admin\/users\/([^/]+)$/.exec(pathname);
   if (userMatch && method === "PATCH") { const user = db.users.find((value) => value.id === userMatch[1]); if (!user) throw httpError(404, "用户不存在。", "not_found", "not_found_error"); const body = await readBody(req); if (body.status && ["active", "suspended", "deleted"].includes(body.status)) user.status = body.status; if (body.role && ["user", "admin"].includes(body.role)) user.role = body.role; dbAudit(current.user, "update_user", user.id, body); persistDatabase(); return sendJson(res, 200, publicUser(user)); }
   const creditMatch = /^\/api\/v1\/admin\/users\/([^/]+)\/credits$/.exec(pathname);
-  if (creditMatch && method === "POST") { const user = db.users.find((value) => value.id === creditMatch[1]); if (!user) throw httpError(404, "用户不存在。", "not_found", "not_found_error"); const body = await readBody(req); const amount = Number(body.amount_micros); if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1_000_000_000_000) throw httpError(400, "充值金额无效。", "invalid_amount"); const wallet = db.wallets.find((value) => value.userId === user.id); wallet.availableMicros += amount; db.ledger.push({ id: id(), userId: user.id, kind: "admin_topup", amountMicros: amount, balanceAfterMicros: wallet.availableMicros, createdAt: now(), createdBy: current.user.id, metadata: { reason: String(body.reason || "管理员充值").slice(0, 500) } }); dbAudit(current.user, "top_up", user.id, { amount_micros: amount }); persistDatabase(); return sendJson(res, 200, { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" }); }
+  if (creditMatch && method === "POST") { const user = db.users.find((value) => value.id === creditMatch[1]); if (!user) throw httpError(404, "用户不存在。", "not_found", "not_found_error"); const body = await readBody(req); const amount = Number(body.amount_micros); if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1_000_000_000_000) throw httpError(400, "充值金额无效。", "invalid_amount"); const wallet = db.wallets.find((value) => value.userId === user.id); wallet.availableMicros += amount; db.ledger.push({ id: id(), userId: user.id, kind: "admin_topup", amountMicros: amount, balanceAfterMicros: wallet.availableMicros, createdAt: now(), createdBy: current.user.id, metadata: { reason: String(body.reason || "管理员充值").slice(0, 500) } }); dbAudit(current.user, "top_up", user.id, { amount_micros: amount }); persistDatabase(); return sendJson(res, 200, publicWallet(wallet)); }
   if (method === "POST" && pathname === "/api/v1/admin/redeem-codes") { const body = await readBody(req); const value = Number(body.value_micros); const maxUses = Number(body.max_uses || 1); if (!Number.isSafeInteger(value) || value < 1 || value > 1_000_000_000_000 || !Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 100_000) throw httpError(400, "兑换码参数无效。", "invalid_redeem_code"); const code = `vv_redeem_${randomToken(18)}`; const record = { id: id(), purpose: "general", codeHash: hash(code), displayPrefix: code.slice(0, 16), valueMicros: value, maxUses, usedCount: 0, expiresAt: body.expires_at || null, disabledAt: null, createdBy: current.user.id, createdAt: now() }; db.redeemCodes.push(record); dbAudit(current.user, "create_redeem_code", record.id, { value_micros: value, max_uses: maxUses, purpose: "general" }); persistDatabase(); return sendJson(res, 201, { id: record.id, code, display_prefix: record.displayPrefix, value_micros: value, max_uses: maxUses, expires_at: record.expiresAt }); }
   if (method === "POST" && pathname === "/api/v1/admin/redeem-batches") {
     const body = await readBody(req);
@@ -1193,7 +1231,11 @@ function appPageV2() {
   const content = `<header class="console-header"><a class="brand-lockup" href="/app"><span class="brand-mark"><img src="/assets/vivant-logo.jpg" alt=""></span><span class="brand-name"><span>Vivant Valley</span><small>玩家服务中心</small></span></a><div class="header-actions"><span id="headerEmail" class="header-account">正在加载...</span><a id="adminLink" class="button-secondary button-small hidden" href="/admin">管理后台</a><button id="logoutButton" class="button-quiet button-small" type="button">退出</button></div></header><div class="console-shell"><aside class="side-nav" aria-label="用户控制台导航"><nav class="nav-group"><button class="nav-button" type="button" data-view="overview" aria-current="page">概览</button><button class="nav-button" type="button" data-view="keys" aria-current="false">设备 Key</button><button class="nav-button" type="button" data-view="usage" aria-current="false">调用记录</button><button class="nav-button" type="button" data-view="credits" aria-current="false">额度中心</button></nav><div class="side-note"><strong id="sideEmail">正在加载...</strong><span>Vivant Valley 托管账户</span></div></aside><main class="console-main" tabindex="-1"><section class="page-panel is-active" data-panel="overview"><div class="page-heading"><div><h1>账户概览</h1><p>服务状态、接入配置和最近使用情况。</p></div><div class="heading-actions"><button class="button-secondary" type="button" data-refresh>刷新</button><button type="button" data-open-key-dialog>创建设备 Key</button></div></div><div class="metric-grid"><article class="metric-card"><span class="metric-label">可用额度</span><strong id="balanceMetric" class="metric-value"><span class="loading-line"></span></strong><div class="metric-meta">额度单位</div></article><article class="metric-card"><span class="metric-label">累计请求</span><strong id="requestMetric" class="metric-value"><span class="loading-line"></span></strong><div class="metric-meta">最近 100 条内统计</div></article><article class="metric-card"><span class="metric-label">累计 Token</span><strong id="tokenMetric" class="metric-value"><span class="loading-line"></span></strong><div class="metric-meta">输入与输出合计</div></article><article class="metric-card"><span class="metric-label">可用设备 Key</span><strong id="keyMetric" class="metric-value"><span class="loading-line"></span></strong><div class="metric-meta">当前有效凭据</div></article></div><div class="overview-grid"><div><section class="work-panel"><div class="panel-header"><div><h2>Mod 配置</h2><p>官方托管服务连接参数</p></div><span id="setupKeyState" class="status-badge warning">正在检查</span></div><div class="panel-body"><dl class="config-list"><div class="config-row"><dt>Base URL</dt><dd><code id="setupBaseUrl" class="config-value">https://www.vivantvalley.com.cn/v1</code></dd><button class="button-secondary button-small" type="button" data-copy="https://www.vivantvalley.com.cn/v1" data-copy-message="Base URL 已复制">复制</button></div><div class="config-row"><dt>模型</dt><dd><code id="setupModel" class="config-value">vv-dialogue</code></dd><button class="button-secondary button-small" type="button" data-copy="vv-dialogue" data-copy-message="模型名已复制">复制</button></div><div class="config-row"><dt>API Key</dt><dd><span class="config-value">使用你创建的 vv_live_... 设备 Key</span></dd><button class="button-secondary button-small" type="button" data-open-key-dialog>新建</button></div></dl></div></section><section class="work-panel"><div class="panel-header"><div><h2>最近调用</h2><p>最近 5 条模型请求</p></div><button class="button-quiet button-small" type="button" data-view="usage">查看全部</button></div><div id="recentUsage"></div></section></div><aside class="work-panel"><div class="panel-header"><div><h2>可用模型</h2><p>公开模型别名和当前价格</p></div></div><div id="modelList" class="panel-body model-list"><span class="loading-line"></span></div></aside></div></section><section class="page-panel" data-panel="keys"><div class="page-heading"><div><h1>设备 Key</h1><p>为每台设备使用独立凭据，遗失后可单独撤销。</p></div><div class="heading-actions"><button class="button-secondary" type="button" data-refresh>刷新</button><button type="button" data-open-key-dialog>创建 Key</button></div></div><section class="work-panel"><div class="panel-header"><div><h2>设备凭据</h2><p>Key 明文仅在创建成功时显示一次</p></div></div><div id="keysTable"><div class="empty-state"><div>正在加载...</div></div></div></section></section><section class="page-panel" data-panel="usage"><div class="page-heading"><div><h1>调用记录</h1><p>查看模型、Token、扣费和请求结果。</p></div><div class="heading-actions"><button class="button-secondary" type="button" data-refresh>刷新</button></div></div><section class="work-panel"><div class="panel-header"><div><h2>请求明细</h2><p id="usageCountLabel">正在加载...</p></div><div class="filter-bar"><label class="visually-hidden" for="usageModelFilter">模型</label><select id="usageModelFilter"><option value="">全部模型</option></select><label class="visually-hidden" for="usageStatusFilter">状态</label><select id="usageStatusFilter"><option value="">全部状态</option><option value="completed">成功</option><option value="failed">失败</option><option value="in_progress">处理中</option></select></div></div><div id="usageTable"><div class="empty-state"><div>正在加载...</div></div></div></section></section><section class="page-panel" data-panel="credits"><div class="page-heading"><div><h1>额度中心</h1><p>兑换额度并核对每笔账户变动。</p></div><div class="heading-actions"><button class="button-secondary" type="button" data-refresh>刷新</button></div></div><div class="redeem-layout"><section class="work-panel"><div class="panel-header"><div><h2>兑换码</h2><p>有效兑换码会立即增加账户额度</p></div></div><div class="panel-body"><form id="redeemForm" class="redeem-form"><div class="field-group"><label for="redeemCode">兑换码</label><input id="redeemCode" type="text" required maxlength="128" autocomplete="off" placeholder="vv_redeem_..."></div><button id="redeemSubmit" type="submit">兑换</button></form></div></section><aside class="credit-summary"><span class="metric-label">当前可用额度</span><strong id="creditBalance" class="metric-value">...</strong><p class="credit-note">另有 <span id="creditReserved">0</span> 额度正在请求中预留。</p></aside></div><section class="work-panel"><div class="panel-header"><div><h2>额度流水</h2><p>充值、兑换、预留、结算和退回记录</p></div></div><div id="ledgerTable"><div class="empty-state"><div>正在加载...</div></div></div></section></section></main></div><dialog id="createKeyDialog"><form id="createKeyForm"><div class="dialog-header"><h2>创建设备 Key</h2><p>建议每台电脑创建一个独立 Key。</p></div><div class="dialog-body"><div class="field-group"><label for="keyLabel">设备名称</label><input id="keyLabel" type="text" required maxlength="80" placeholder="例如：家用电脑"></div><div class="field-group"><label for="keyExpiry">有效期</label><select id="keyExpiry"><option value="0">永不过期</option><option value="30">30 天</option><option value="90">90 天</option><option value="365">365 天</option></select></div></div><div class="dialog-actions"><button class="button-secondary" type="button" data-close-dialog="createKeyDialog">取消</button><button id="createKeySubmit" type="submit">创建 Key</button></div></form></dialog><dialog id="createdKeyDialog"><div class="dialog-header"><h2>设备 Key 已创建</h2><p>关闭后无法再次查看完整内容。</p></div><div class="dialog-body"><div class="secret-box"><code id="createdKeyValue" class="secret-value"></code></div><p class="secret-warning">请妥善保管，不要发送给其他人或填写到非官方网页。</p></div><div class="dialog-actions"><button id="copyCreatedKey" class="button-secondary" type="button" data-copy="" data-copy-message="设备 Key 已复制">复制 Key</button><button type="button" data-close-dialog="createdKeyDialog">我已保存</button></div></dialog><div id="toastRegion" class="toast-region" aria-live="polite"></div>`;
   // The web console keeps legacy device-key management for older Mod builds;
   // new players authenticate directly inside the Mod with a hosted session.
-  return userShell("用户控制台", "console-page", content, "/assets/app.js");
+  const displayContent = content
+    .replace(">可用额度<", ">剩余余额<")
+    .replace(">额度单位<", ">人民币，可用金额<")
+    .replace(">当前可用额度<", ">当前余额<");
+  return userShell("用户控制台", "console-page", displayContent, "/assets/app.js");
 }
 
 function adminPage() {

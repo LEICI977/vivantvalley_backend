@@ -40,6 +40,7 @@ async function api(path, options = {}) {
 
 const number = new Intl.NumberFormat("zh-CN");
 const credits = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 0, maximumFractionDigits: 6 });
+const money = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const dateTime = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
   month: "2-digit",
@@ -51,6 +52,18 @@ const dateTime = new Intl.DateTimeFormat("zh-CN", {
 
 function formatCredits(micros) {
   return credits.format((Number(micros) || 0) / 1_000_000);
+}
+
+function formatMoney(micros) {
+  return `¥${money.format((Number(micros) || 0) / 1_000_000)}`;
+}
+
+function formatModelPrice(model) {
+  const input = Number(model.input_micros_per_1k) || 0;
+  const output = Number(model.output_micros_per_1k) || 0;
+  const cached = Number(model.cached_input_micros_per_1k) || 0;
+  if (input === output && output === cached) return `每 1,000,000 Token ${formatMoney(input * 1000)}`;
+  return `输入 ${formatMoney(input * 1000)} / 1M；输出 ${formatMoney(output * 1000)} / 1M`;
 }
 
 function formatDate(value, fallback = "从未") {
@@ -112,12 +125,12 @@ function activeKeys() {
 function renderAccount() {
   document.getElementById("headerEmail").textContent = state.me.email;
   document.getElementById("sideEmail").textContent = state.me.email;
-  document.getElementById("balanceMetric").textContent = formatCredits(state.me.wallet.available_micros);
+  document.getElementById("balanceMetric").textContent = formatMoney(state.me.wallet.available_micros);
   document.getElementById("requestMetric").textContent = number.format(state.usage.length);
   document.getElementById("tokenMetric").textContent = number.format(state.usageTotals.prompt_tokens + state.usageTotals.completion_tokens);
   document.getElementById("keyMetric").textContent = number.format(activeKeys().length);
-  document.getElementById("creditBalance").textContent = formatCredits(state.me.wallet.available_micros);
-  document.getElementById("creditReserved").textContent = formatCredits(state.me.wallet.reserved_micros);
+  document.getElementById("creditBalance").textContent = formatMoney(state.me.wallet.available_micros);
+  document.getElementById("creditReserved").textContent = formatMoney(state.me.wallet.reserved_micros);
   if (state.me.role === "admin") document.getElementById("adminLink").classList.remove("hidden");
 }
 
@@ -138,8 +151,7 @@ function renderSetup() {
         <span>上下文 ${number.format(model.max_input_tokens)} · 最大输出 ${number.format(model.max_output_tokens)}</span>
       </div>
       <div class="model-price">
-        输入 ${formatCredits(model.input_micros_per_1k)} / 1K<br>
-        输出 ${formatCredits(model.output_micros_per_1k)} / 1K
+        ${formatModelPrice(model)}
       </div>
     </div>`).join("") : '<div class="empty-state"><div><strong>暂无可用模型</strong>请稍后刷新页面。</div></div>';
 }
@@ -151,7 +163,7 @@ function usageRows(items) {
       <td><span class="table-primary">${formatDate(item.created_at)}</span><span class="table-secondary table-code">${escapeHtml(item.request_id.slice(0, 12))}</span></td>
       <td><span class="table-code">${escapeHtml(item.model_alias)}</span></td>
       <td>${number.format(item.usage.prompt_tokens)} / ${number.format(item.usage.completion_tokens)}</td>
-      <td>${formatCredits(item.cost_micros)}</td>
+      <td>${formatMoney(item.cost_micros)}</td>
       <td><span class="status-badge ${statusClass}">${statusText}</span></td>
     </tr>`;
   }).join("");
@@ -222,12 +234,12 @@ function renderLedger() {
     <tbody>${state.ledger.map((entry) => {
       const amount = Number(entry.amount_micros) || 0;
       const amountClass = amount > 0 ? "positive" : amount < 0 ? "negative" : "";
-      const amountText = amount > 0 ? `+${formatCredits(amount)}` : formatCredits(amount);
+      const amountText = amount > 0 ? `+${formatMoney(amount)}` : formatMoney(amount);
       return `<tr>
         <td>${formatDate(entry.created_at)}</td>
         <td><span class="table-primary">${escapeHtml(ledgerLabel(entry.kind))}</span></td>
         <td><span class="${amountClass}">${amountText}</span></td>
-        <td>${formatCredits(entry.balance_after_micros)}</td>
+        <td>${formatMoney(entry.balance_after_micros)}</td>
         <td>${escapeHtml(entry.note || "-")}</td>
       </tr>`;
     }).join("")}</tbody>

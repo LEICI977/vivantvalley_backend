@@ -117,9 +117,24 @@ GET  /api/v1/admin/redeem-batches                 # metadata only; plaintext is 
 POST /api/v1/admin/redeem-batches/{id}/disable    # disable all unused codes in a batch
 ```
 
-Each yuan maps to `1,000,000 credit_micros`. A successful batch response
-contains the 100 plaintext codes and a newline-delimited `codes_text` value;
-download it immediately because the server stores only code hashes.
+Each yuan maps to `1,000,000 credit_micros`. Hosted billing charges the total
+input plus output usage at `1,000 micros` per 1K tokens, which is exactly
+`1,000,000 tokens = 1 yuan`; `balance_yuan` in Mod wallet responses is a
+two-decimal display string. A successful batch response contains the 100
+plaintext codes and a newline-delimited `codes_text` value; download it
+immediately because the server stores only code hashes.
+
+The Mod's purchase buttons open the configured payment pages:
+
+```text
+1 yuan:  https://pay.ldxp.cn/item/jxtjmi
+5 yuan:  https://pay.ldxp.cn/item/eip1kt
+10 yuan: https://pay.ldxp.cn/item/mus6ix
+20 yuan: https://pay.ldxp.cn/item/mpk1fb
+```
+
+Payment pages currently deliver a redeem code; the player pastes that code
+into the Mod and selects "兑换额度". No automatic payment callback is assumed.
 
 Hosted requests default to non-thinking mode. The gateway removes client-side
 thinking options and negotiates a compatible disabled form with each upstream
@@ -162,8 +177,8 @@ the Node port directly.
 ## Demo boundaries
 
 The demo JSON store is intentionally single-process and is not a replacement
-for PostgreSQL/Redis. The default model prices are sample `credit_micros`
-values and the admin margin view uses a demo provider-cost ratio. Before any
+for PostgreSQL/Redis. The default model prices implement the hosted rule above;
+the admin margin view still uses a demo provider-cost ratio. Before any
 real users or money are involved, migrate the ledger to PostgreSQL, move rate
 limits/idempotency/concurrency to Redis, configure real provider prices from
 the provider invoices, and add a real payment/reconciliation workflow. The

@@ -34,6 +34,7 @@ try {
   const appPage = await request("/app", { raw: true });
   assert.equal(appPage.status, 200);
   assert.match(appPage.text, /账户概览/);
+  assert.match(appPage.text, /剩余余额/);
   const css = await request("/assets/user.css", { raw: true });
   assert.equal(css.status, 200);
   assert.match(css.contentType, /text\/css/);
@@ -48,6 +49,9 @@ try {
   assert.equal(bootstrap.status, 200);
   assert.equal(bootstrap.data.base_url, "https://www.vivantvalley.com.cn/v1");
   assert.ok(bootstrap.data.models.some((model) => model.alias === "vv-dialogue"));
+  assert.equal(bootstrap.data.wallet.balance_yuan, "0.00");
+  assert.equal(bootstrap.data.wallet.pricing_rule, "每 1,000,000 Token 收费 1 元");
+  assert.equal(bootstrap.data.models.find((model) => model.alias === "vv-dialogue").input_micros_per_1k, 1000);
   const models = await request("/v1/models", { headers: { authorization: `Bearer ${key.data.key}` } });
   assert.equal(models.status, 200);
   assert.ok(models.data.data.some((model) => model.id === "vv-dialogue"));
