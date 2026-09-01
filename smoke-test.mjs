@@ -3,11 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const port = 18987;
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "vivant-valley-demo-"));
 const child = spawn(process.execPath, ["server.js"], {
-  cwd: path.dirname(new URL(import.meta.url).pathname),
+  cwd: path.dirname(fileURLToPath(import.meta.url)),
   env: { ...process.env, PORT: String(port), DATA_FILE: path.join(temp, "db.json"), DEMO_MODE: "true", ADMIN_EMAIL: "admin@example.com", ADMIN_PASSWORD: "admin-password-123", ADMIN_PAGE_PASSWORD: "admin-page-password-123" },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -39,9 +40,20 @@ try {
   const key = await request("/api/v1/keys", { method: "POST", cookies, csrf, body: { label: "smoke laptop" } });
   assert.equal(key.status, 201);
   assert.match(key.data.key, /^vv_live_[A-Za-z0-9_-]{32,}$/);
+  const modLogin = await request("/api/v1/mod/auth/login", { method: "POST", body: { email: "player@example.com", password: "player-password-123" } });
+  assert.equal(modLogin.status, 200);
+  assert.match(modLogin.data.access_token, /^vv_mod_[A-Za-z0-9_-]{32,}$/);
+  const modToken = modLogin.data.access_token;
+  const bootstrap = await request("/api/v1/mod/bootstrap", { headers: { authorization: `Bearer ${modToken}` } });
+  assert.equal(bootstrap.status, 200);
+  assert.equal(bootstrap.data.base_url, "https://www.vivantvalley.com.cn/v1");
+  assert.ok(bootstrap.data.models.some((model) => model.alias === "vv-dialogue"));
   const models = await request("/v1/models", { headers: { authorization: `Bearer ${key.data.key}` } });
   assert.equal(models.status, 200);
   assert.ok(models.data.data.some((model) => model.id === "vv-dialogue"));
+  const modModels = await request("/v1/models", { headers: { authorization: `Bearer ${modToken}` } });
+  assert.equal(modModels.status, 200);
+  assert.ok(modModels.data.data.some((model) => model.id === "vv-dialogue"));
   const insufficient = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}`, "idempotency-key": "smoke-1" }, body: { model: "vv-dialogue", messages: [{ role: "user", content: "hello" }], max_tokens: 64 } });
   assert.equal(insufficient.status, 402);
 
@@ -72,11 +84,59 @@ try {
   const runtimeDemo = await request("/api/v1/admin/settings/runtime", { method: "PATCH", cookies: adminAccess.cookies, csrf: adminCsrf, body: { demo_mode: true } });
   assert.equal(runtimeDemo.status, 200);
   assert.equal(runtimeDemo.data.demo_mode, true);
+  const suspended = await request(`/api/v1/admin/users/${user.data.user.id}`, { method: "PATCH", cookies: adminAccess.cookies, csrf: adminCsrf, body: { status: "suspended" } });
+  assert.equal(suspended.status, 200);
+  const suspendedModels = await request("/v1/models", { headers: { authorization: `Bearer ${modToken}` } });
+  assert.equal(suspendedModels.status, 403);
+  const suspendedBootstrap = await request("/api/v1/mod/bootstrap", { headers: { authorization: `Bearer ${modToken}` } });
+  assert.equal(suspendedBootstrap.status, 403);
+  const suspendedRedeem = await request("/api/v1/mod/redeem", { method: "POST", headers: { authorization: `Bearer ${modToken}` }, body: { code: "not-used" } });
+  assert.equal(suspendedRedeem.status, 403);
+  const restored = await request(`/api/v1/admin/users/${user.data.user.id}`, { method: "PATCH", cookies: adminAccess.cookies, csrf: adminCsrf, body: { status: "active" } });
+  assert.equal(restored.status, 200);
   const topup = await request(`/api/v1/admin/users/${user.data.user.id}/credits`, { method: "POST", cookies: adminAccess.cookies, csrf: adminCsrf, body: { amount_micros: 100000, reason: "smoke" } });
   assert.equal(topup.status, 200);
   const completion = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}`, "idempotency-key": "smoke-2" }, body: { model: "vv-dialogue", messages: [{ role: "user", content: "hello" }], max_tokens: 64 } });
   assert.equal(completion.status, 200);
   assert.equal(completion.data.model, "vv-dialogue");
+  const actionRound = await request("/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${modToken}`, "idempotency-key": "mod-tool-1" },
+    body: {
+      model: "vv-dialogue",
+      messages: [{ role: "system", content: "Choose an allowed action." }, { role: "user", content: "Come to the mines with me." }],
+      tools: [{ type: "function", function: { name: "invite_mine_guard", description: "Accept a mine invitation.", parameters: { type: "object", properties: {}, additionalProperties: false } } }],
+      tool_choice: "auto",
+      stream: false,
+      max_tokens: 256,
+    },
+  });
+  assert.equal(actionRound.status, 200);
+  const actionCall = actionRound.data.choices[0].message.tool_calls[0];
+  assert.equal(actionCall.function.name, "invite_mine_guard");
+  assert.equal(typeof actionCall.function.arguments, "string");
+  const finalRound = await request("/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${modToken}`, "idempotency-key": "mod-tool-2" },
+    body: {
+      model: "vv-dialogue",
+      messages: [
+        { role: "system", content: "Return the final NPC response." },
+        { role: "user", content: "Come to the mines with me." },
+        actionRound.data.choices[0].message,
+        { role: "tool", tool_call_id: actionCall.id, content: JSON.stringify({ ok: true, status: "completed" }) },
+      ],
+      tools: [{ type: "function", function: { name: "submit_final_response", description: "Submit the final response.", parameters: { type: "object" } } }],
+      tool_choice: { type: "function", function: { name: "submit_final_response" } },
+      stream: false,
+      max_tokens: 512,
+    },
+  });
+  assert.equal(finalRound.status, 200);
+  const finalCall = finalRound.data.choices[0].message.tool_calls[0];
+  assert.equal(finalCall.function.name, "submit_final_response");
+  assert.equal(typeof finalCall.function.arguments, "string");
+  assert.equal(JSON.parse(finalCall.function.arguments).decision, "reply");
   const replay = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}`, "idempotency-key": "smoke-2" }, body: { model: "vv-dialogue", messages: [{ role: "user", content: "hello" }], max_tokens: 64 } });
   assert.equal(replay.status, 200);
   assert.equal(replay.data.id, completion.data.id);
@@ -105,15 +165,21 @@ try {
   const updatedModel = await request("/api/v1/admin/models/vv-fast", { method: "PATCH", cookies: adminAccess.cookies, csrf: adminCsrf, body: { inputMicrosPer1k: 701 } });
   assert.equal(updatedModel.status, 200);
   assert.equal(updatedModel.data.inputMicrosPer1k, 701);
-  const createdRedeem = await request("/api/v1/admin/redeem-codes", { method: "POST", cookies: adminAccess.cookies, csrf: adminCsrf, body: { value_micros: 5000, max_uses: 1 } });
+  const createdRedeem = await request("/api/v1/admin/redeem-codes", { method: "POST", cookies: adminAccess.cookies, csrf: adminCsrf, body: { value_micros: 5000, max_uses: 2 } });
   assert.equal(createdRedeem.status, 201);
   const redeemed = await request("/api/v1/redeem", { method: "POST", cookies, csrf, body: { code: createdRedeem.data.code } });
   assert.equal(redeemed.status, 200);
+  const modRedeemed = await request("/api/v1/mod/redeem", { method: "POST", headers: { authorization: `Bearer ${modToken}` }, body: { code: createdRedeem.data.code } });
+  assert.equal(modRedeemed.status, 200);
   const listedKeys = await request("/api/v1/keys", { cookies });
   const revoked = await request(`/api/v1/keys/${listedKeys.data.items[0].id}`, { method: "DELETE", cookies, csrf });
   assert.equal(revoked.status, 204);
   const revokedModels = await request("/v1/models", { headers: { authorization: `Bearer ${key.data.key}` } });
   assert.equal(revokedModels.status, 401);
+  const modLogout = await request("/api/v1/mod/auth/logout", { method: "POST", headers: { authorization: `Bearer ${modToken}` } });
+  assert.equal(modLogout.status, 204);
+  const loggedOutModels = await request("/v1/models", { headers: { authorization: `Bearer ${modToken}` } });
+  assert.equal(loggedOutModels.status, 401);
   console.log("backend demo smoke checks passed");
 } catch (error) {
   console.error(output);

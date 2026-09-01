@@ -488,6 +488,18 @@ function requireSession(req, res, role = null) {
   return current;
 }
 
+function requireModSession(req) {
+  const current = session(req);
+  if (!current || current.record.kind !== "mod") {
+    throw httpError(401, "托管账户会话无效或已过期。", "invalid_mod_session", "auth_error");
+  }
+  if (current.user.status !== "active") {
+    throw httpError(403, "账户当前不可用。", "account_suspended", "forbidden_error");
+  }
+  current.record.lastSeenAt = now();
+  return current;
+}
+
 function requireCsrf(req, current) {
   const provided = String(req.headers["x-csrf-token"] || "");
   return provided.length > 0 && provided.length === 32 && hash(provided) === current.record.csrfHash;
@@ -822,8 +834,7 @@ async function api(req, res, url) {
       return sendJson(res, 200, { base_url: "https://www.vivantvalley.com.cn/v1", items });
     }
     if (method === "GET" && pathname === "/api/v1/mod/bootstrap") {
-      const current = session(req);
-      if (!current || current.record.kind !== "mod") throw httpError(401, "托管账户会话无效或已过期。", "invalid_mod_session", "auth_error");
+      const current = requireModSession(req);
       const items = db.modelAliases.filter((value) => value.enabled).map((value) => ({
         alias: value.alias,
         max_input_tokens: value.maxInputTokens,
@@ -836,8 +847,7 @@ async function api(req, res, url) {
       return sendJson(res, 200, { user: publicUser(current.user), base_url: "https://www.vivantvalley.com.cn/v1", models: items, wallet: { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" } });
     }
     if (method === "POST" && pathname === "/api/v1/mod/redeem") {
-      const current = session(req);
-      if (!current || current.record.kind !== "mod") throw httpError(401, "托管账户会话无效或已过期。", "invalid_mod_session", "auth_error");
+      const current = requireModSession(req);
       const body = await readBody(req);
       const code = db.redeemCodes.find((value) => value.codeHash === hash(String(body.code || "").trim()) && !value.disabledAt && value.usedCount < value.maxUses && (!value.expiresAt || new Date(value.expiresAt) > new Date()));
       if (!code) throw httpError(409, "兑换码无效、已使用或已过期。", "invalid_redeem_code", "conflict_error");
