@@ -136,7 +136,12 @@ try {
   const finalCall = finalRound.data.choices[0].message.tool_calls[0];
   assert.equal(finalCall.function.name, "submit_final_response");
   assert.equal(typeof finalCall.function.arguments, "string");
-  assert.equal(JSON.parse(finalCall.function.arguments).decision, "reply");
+  const finalArguments = JSON.parse(finalCall.function.arguments);
+  assert.equal(finalArguments.decision, "reply");
+  assert.equal(finalArguments.memory_update.summary_patch, "");
+  for (const signalName of ["valence", "warmth", "concern", "confidence"]) {
+    assert.equal(typeof finalArguments.memory_update.signal[signalName], "number");
+  }
   const replay = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}`, "idempotency-key": "smoke-2" }, body: { model: "vv-dialogue", messages: [{ role: "user", content: "hello" }], max_tokens: 64 } });
   assert.equal(replay.status, 200);
   assert.equal(replay.data.id, completion.data.id);

@@ -608,7 +608,7 @@ function demoCompletion(body, alias, requestIdValue) {
   const promptTokens = estimateTokens(body.messages);
   if (tool && Array.isArray(body.tools)) {
     const argumentsValue = tool === "submit_final_response"
-      ? JSON.stringify({ schema_version: 1, decision: "reply", reply: "这是托管服务 Demo 返回的测试回复。", travel_barks: [], memory_update: { summary_patch: "", topics: [], open_loops: [] } })
+      ? JSON.stringify({ schema_version: 1, decision: "reply", reply: "这是托管服务 Demo 返回的测试回复。", travel_barks: [], memory_update: { summary_patch: "", signal: { valence: 0, warmth: 0, concern: 0, confidence: 0 }, topics: [], open_loops: [] } })
       : JSON.stringify({});
     return normalizeResponse({ choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ id: `call_${randomToken(12)}`, type: "function", function: { name: tool, arguments: argumentsValue } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: promptTokens, completion_tokens: 32, total_tokens: promptTokens + 32 } }, alias, requestIdValue);
   }
