@@ -109,6 +109,18 @@ POST   /api/v1/admin/providers/{id}/test  # small real tool-call compatibility p
 DELETE /api/v1/admin/providers/{id}
 ```
 
+Card-code batches are available to administrators:
+
+```text
+POST /api/v1/admin/redeem-batches                 # denomination_yuan: 1, 5, 10, or 20; always 100 codes
+GET  /api/v1/admin/redeem-batches                 # metadata only; plaintext is never persisted
+POST /api/v1/admin/redeem-batches/{id}/disable    # disable all unused codes in a batch
+```
+
+Each yuan maps to `1,000,000 credit_micros`. A successful batch response
+contains the 100 plaintext codes and a newline-delimited `codes_text` value;
+download it immediately because the server stores only code hashes.
+
 Hosted requests default to non-thinking mode. The gateway removes client-side
 thinking options and negotiates a compatible disabled form with each upstream
 before falling back to a standard OpenAI request that omits vendor fields.

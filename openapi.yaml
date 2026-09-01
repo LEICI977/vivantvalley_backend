@@ -655,6 +655,93 @@ paths:
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/AuthError' }
         '403': { $ref: '#/components/responses/ForbiddenError' }
+  /api/v1/admin/redeem-batches:
+    get:
+      tags: [Admin]
+      operationId: adminListRedeemBatches
+      summary: List generated card-code batches without plaintext codes
+      security:
+        - SessionCookie: []
+      responses:
+        '200':
+          description: Card-code batch metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RedeemBatchPage' }
+        '401': { $ref: '#/components/responses/AuthError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+    post:
+      tags: [Admin]
+      operationId: adminCreateRedeemBatch
+      summary: Generate 100 one-time fixed-denomination card codes
+      security:
+        - SessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRedeemBatchRequest' }
+      responses:
+        '201':
+          description: Plaintext codes are returned once for download; only hashes are persisted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedRedeemBatch' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/AuthError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+  /api/v1/admin/redeem-batches/{id}/disable:
+    post:
+      tags: [Admin]
+      operationId: adminDisableRedeemBatch
+      summary: Disable all unused codes in a batch
+      security:
+        - SessionCookie: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '200':
+          description: Batch disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RedeemBatch' }
+        '401': { $ref: '#/components/responses/AuthError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+  /api/v1/admin/redeem-batches/{id}/codes:
+    get:
+      tags: [Admin]
+      operationId: adminDownloadRedeemBatchCodes
+      summary: Recover encrypted plaintext codes for an administrator
+      security:
+        - SessionCookie: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Newline-delimited plaintext codes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [batch, codes_text, download_name]
+                properties:
+                  batch: { $ref: '#/components/schemas/RedeemBatch' }
+                  codes_text: { type: string }
+                  download_name: { type: string }
+        '401': { $ref: '#/components/responses/AuthError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '410': { $ref: '#/components/responses/GoneError' }
   /api/v1/admin/invitations:
     post:
       tags: [Admin]
@@ -1029,6 +1116,10 @@ components:
       description: Duplicate email, idempotency conflict or already consumed code
       content:
         application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } }
+    GoneError:
+      description: Resource is no longer available
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } }
     RateLimitError:
       description: RPM or concurrent-request limit exceeded
       headers:
@@ -1377,6 +1468,45 @@ components:
         value_micros: { type: integer, format: int64 }
         max_uses: { type: integer }
         expires_at: { type: [string, 'null'], format: date-time }
+    CreateRedeemBatchRequest:
+      type: object
+      required: [denomination_yuan]
+      properties:
+        denomination_yuan: { type: integer, enum: [1, 5, 10, 20] }
+        count: { type: integer, enum: [100], default: 100 }
+        expires_at: { type: string, format: date-time }
+      additionalProperties: false
+    RedeemBatch:
+      type: object
+      required: [id, denomination_yuan, value_micros, code_count, used_count, remaining_count, disabled, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        denomination_yuan: { type: integer, enum: [1, 5, 10, 20] }
+        value_micros: { type: integer, format: int64, minimum: 1 }
+        code_count: { type: integer, const: 100 }
+        used_count: { type: integer, minimum: 0 }
+        remaining_count: { type: integer, minimum: 0 }
+        expires_at: { type: [string, 'null'], format: date-time }
+        disabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+    RedeemBatchPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/RedeemBatch' } }
+    CreatedRedeemBatch:
+      type: object
+      required: [batch, codes, codes_text, download_name]
+      properties:
+        batch: { $ref: '#/components/schemas/RedeemBatch' }
+        codes:
+          type: array
+          minItems: 100
+          maxItems: 100
+          items: { type: string, pattern: '^VV(1|5|10|20)-[A-F0-9]{24}$' }
+        codes_text: { type: string, description: One code per line }
+        download_name: { type: string }
+        warning: { type: string }
     AdminCreateUserRequest:
       type: object
       required: [email, password]

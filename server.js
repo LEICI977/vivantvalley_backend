@@ -24,6 +24,10 @@ const config = {
   rateLimitPerMinute: positiveInt(process.env.RATE_LIMIT_PER_MINUTE, 60),
 };
 
+const CARD_VALUE_MICROS_PER_YUAN = 1_000_000;
+const CARD_BATCH_COUNT = 100;
+const CARD_DENOMINATIONS_YUAN = new Set([1, 5, 10, 20]);
+
 if (config.pepper === "demo-pepper-change-me") {
   console.warn("WARNING: BACKEND_PEPPER is using the demo value; change it before production use.");
 }
@@ -155,6 +159,7 @@ function emptyDatabase() {
     ledger: [],
     requests: [],
     redeemCodes: [],
+    redeemBatches: [],
     providers: [],
     modelAliases: [],
     settings: { invitationRequired: config.invitationRequired, demoMode: config.demoMode },
@@ -168,6 +173,7 @@ function loadDatabase() {
     const loaded = { ...fresh, ...parsed, settings: { ...fresh.settings, ...(parsed.settings || {}) } };
     if (!Array.isArray(loaded.providers)) loaded.providers = [];
     if (!Array.isArray(loaded.modelAliases)) loaded.modelAliases = [];
+    if (!Array.isArray(loaded.redeemBatches)) loaded.redeemBatches = [];
     return loaded;
   } catch {
     return emptyDatabase();
@@ -282,6 +288,47 @@ function runtimeMode() {
 
 function demoModeEnabled() {
   return Boolean(db.settings.demoMode);
+}
+
+function findRedeemCode(rawCode, purpose = "credit") {
+  const code = String(rawCode || "").trim();
+  if (!code) return null;
+  const candidates = [code];
+  const upper = code.toUpperCase();
+  if (upper !== code) candidates.push(upper);
+  return db.redeemCodes.find((value) => candidates.some((candidate) => value.codeHash === hash(candidate))
+    && (purpose === "invitation"
+      ? !value.batchId && (!value.purpose || value.purpose === "invitation" || value.purpose === "general")
+      : (!value.purpose || value.purpose === "credit" || value.purpose === "general"))
+    && !value.disabledAt
+    && value.usedCount < value.maxUses
+    && (!value.expiresAt || new Date(value.expiresAt) > new Date()));
+}
+
+function consumeRedeemCode(code) {
+  code.usedCount += 1;
+  if (code.batchId) {
+    const batch = db.redeemBatches.find((value) => value.id === code.batchId);
+    if (batch) batch.usedCount = Math.min(batch.codeCount, Number(batch.usedCount || 0) + 1);
+  }
+}
+
+function createCardCode(denominationYuan) {
+  return `VV${denominationYuan}-${crypto.randomBytes(12).toString("hex").toUpperCase()}`;
+}
+
+function publicRedeemBatch(batch) {
+  return {
+    id: batch.id,
+    denomination_yuan: batch.denominationYuan,
+    value_micros: batch.valueMicros,
+    code_count: batch.codeCount,
+    used_count: batch.usedCount || 0,
+    remaining_count: Math.max(0, batch.codeCount - (batch.usedCount || 0)),
+    expires_at: batch.expiresAt || null,
+    disabled: Boolean(batch.disabledAt),
+    created_at: batch.createdAt,
+  };
 }
 
 function withNonThinkingMode(payload, mode) {
@@ -849,9 +896,9 @@ async function api(req, res, url) {
       if (!email.includes("@") || email.length > 320 || password.length < 12) throw httpError(400, "请输入有效邮箱和至少 12 位密码。", "invalid_credentials");
       if (db.settings.invitationRequired) {
         const code = String(body.invitation_code || "").trim();
-        const redeem = db.redeemCodes.find((value) => value.codeHash === hash(code) && !value.disabledAt && value.usedCount < value.maxUses && (!value.expiresAt || new Date(value.expiresAt) > new Date()));
+        const redeem = findRedeemCode(code, "invitation");
         if (!redeem) throw httpError(400, "当前注册需要有效邀请码。", "invitation_required");
-        redeem.usedCount += 1;
+        consumeRedeemCode(redeem);
       }
       if (db.users.some((value) => value.email === email)) throw httpError(409, "邮箱已注册。", "email_exists", "conflict_error");
       const user = { id: id(), email, passwordHash: passwordHash(password), role: "user", status: "active", createdAt: now(), lastLoginAt: null };
@@ -875,9 +922,9 @@ async function api(req, res, url) {
       if (register) {
         if (db.settings.invitationRequired) {
           const code = String(body.invitation_code || "").trim();
-          const redeem = db.redeemCodes.find((value) => value.codeHash === hash(code) && !value.disabledAt && value.usedCount < value.maxUses && (!value.expiresAt || new Date(value.expiresAt) > new Date()));
+          const redeem = findRedeemCode(code, "invitation");
           if (!redeem) throw httpError(400, "当前注册需要有效邀请码。", "invitation_required");
-          redeem.usedCount += 1;
+          consumeRedeemCode(redeem);
         }
         if (user) throw httpError(409, "邮箱已注册。", "email_exists", "conflict_error");
         user = { id: id(), email, passwordHash: passwordHash(password), role: "user", status: "active", createdAt: now(), lastLoginAt: null };
@@ -934,9 +981,9 @@ async function api(req, res, url) {
     if (method === "POST" && pathname === "/api/v1/mod/redeem") {
       const current = requireModSession(req);
       const body = await readBody(req);
-      const code = db.redeemCodes.find((value) => value.codeHash === hash(String(body.code || "").trim()) && !value.disabledAt && value.usedCount < value.maxUses && (!value.expiresAt || new Date(value.expiresAt) > new Date()));
+      const code = findRedeemCode(body.code, "credit");
       if (!code) throw httpError(409, "兑换码无效、已使用或已过期。", "invalid_redeem_code", "conflict_error");
-      code.usedCount += 1;
+      consumeRedeemCode(code);
       const wallet = db.wallets.find((value) => value.userId === current.user.id);
       wallet.availableMicros += code.valueMicros;
       db.ledger.push({ id: id(), userId: current.user.id, kind: "redeem", amountMicros: code.valueMicros, balanceAfterMicros: wallet.availableMicros, createdAt: now(), metadata: { redeem_code: code.displayPrefix, source: "mod" } });
@@ -949,7 +996,7 @@ async function api(req, res, url) {
     if (pathname === "/api/v1/keys" && method === "POST") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const body = await readBody(req).catch((error) => error.status ? {} : Promise.reject(error)); const created = createKey(current.user.id, body.label, body.expires_at || null); return sendJson(res, 201, { id: created.record.id, key: created.value, display_prefix: created.record.displayPrefix, label: created.record.label, created_at: created.record.createdAt, last_used_at: null, expires_at: created.record.expiresAt, revoked: false }); }
     const keyMatch = /^\/api\/v1\/keys\/([^/]+)$/.exec(pathname);
     if (keyMatch && method === "DELETE") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const key = db.deviceKeys.find((value) => value.id === keyMatch[1] && value.userId === current.user.id); if (!key) throw httpError(404, "设备 Key 不存在。", "not_found", "not_found_error"); key.revokedAt ||= now(); persistDatabase(); return sendJson(res, 204, null); }
-    if (method === "POST" && pathname === "/api/v1/redeem") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const body = await readBody(req); const code = db.redeemCodes.find((value) => value.codeHash === hash(String(body.code || "").trim()) && !value.disabledAt && value.usedCount < value.maxUses && (!value.expiresAt || new Date(value.expiresAt) > new Date())); if (!code) throw httpError(409, "兑换码无效、已使用或已过期。", "invalid_redeem_code", "conflict_error"); code.usedCount += 1; const wallet = db.wallets.find((value) => value.userId === current.user.id); wallet.availableMicros += code.valueMicros; db.ledger.push({ id: id(), userId: current.user.id, kind: "redeem", amountMicros: code.valueMicros, balanceAfterMicros: wallet.availableMicros, createdAt: now(), metadata: { redeem_code: code.displayPrefix } }); persistDatabase(); return sendJson(res, 200, { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" }); }
+    if (method === "POST" && pathname === "/api/v1/redeem") { const current = requireSession(req, res); if (!current) return; if (!requireCsrf(req, current)) throw httpError(403, "CSRF 校验失败。", "csrf_failed", "forbidden_error"); const body = await readBody(req); const code = findRedeemCode(body.code, "credit"); if (!code) throw httpError(409, "兑换码无效、已使用或已过期。", "invalid_redeem_code", "conflict_error"); consumeRedeemCode(code); const wallet = db.wallets.find((value) => value.userId === current.user.id); wallet.availableMicros += code.valueMicros; db.ledger.push({ id: id(), userId: current.user.id, kind: "redeem", amountMicros: code.valueMicros, balanceAfterMicros: wallet.availableMicros, createdAt: now(), metadata: { redeem_code: code.displayPrefix, batch_id: code.batchId || null, denomination_yuan: code.denominationYuan || null } }); persistDatabase(); return sendJson(res, 200, { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros", redeemed_value_micros: code.valueMicros }); }
     if (pathname === "/v1/models" && method === "GET") { const auth = device(req, res); if (!auth) return; return sendJson(res, 200, { object: "list", data: db.modelAliases.filter((value) => value.enabled).map((value) => ({ id: value.alias, object: "model", owned_by: "vivant-valley" })) }); }
     if ((pathname === "/v1/chat/completions" || pathname === "/chat/completions") && method === "POST") return chatCompletion(req, res);
     if (pathname.startsWith("/api/v1/admin/")) {
@@ -975,7 +1022,61 @@ async function adminApi(req, res, url) {
   if (userMatch && method === "PATCH") { const user = db.users.find((value) => value.id === userMatch[1]); if (!user) throw httpError(404, "用户不存在。", "not_found", "not_found_error"); const body = await readBody(req); if (body.status && ["active", "suspended", "deleted"].includes(body.status)) user.status = body.status; if (body.role && ["user", "admin"].includes(body.role)) user.role = body.role; dbAudit(current.user, "update_user", user.id, body); persistDatabase(); return sendJson(res, 200, publicUser(user)); }
   const creditMatch = /^\/api\/v1\/admin\/users\/([^/]+)\/credits$/.exec(pathname);
   if (creditMatch && method === "POST") { const user = db.users.find((value) => value.id === creditMatch[1]); if (!user) throw httpError(404, "用户不存在。", "not_found", "not_found_error"); const body = await readBody(req); const amount = Number(body.amount_micros); if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1_000_000_000_000) throw httpError(400, "充值金额无效。", "invalid_amount"); const wallet = db.wallets.find((value) => value.userId === user.id); wallet.availableMicros += amount; db.ledger.push({ id: id(), userId: user.id, kind: "admin_topup", amountMicros: amount, balanceAfterMicros: wallet.availableMicros, createdAt: now(), createdBy: current.user.id, metadata: { reason: String(body.reason || "管理员充值").slice(0, 500) } }); dbAudit(current.user, "top_up", user.id, { amount_micros: amount }); persistDatabase(); return sendJson(res, 200, { available_micros: wallet.availableMicros, reserved_micros: wallet.reservedMicros, currency: "credit_micros" }); }
-  if (method === "POST" && pathname === "/api/v1/admin/redeem-codes") { const body = await readBody(req); const value = Number(body.value_micros); const maxUses = Number(body.max_uses || 1); if (!Number.isSafeInteger(value) || value < 1 || !Number.isSafeInteger(maxUses) || maxUses < 1) throw httpError(400, "兑换码参数无效。", "invalid_redeem_code"); const code = `vv_redeem_${randomToken(18)}`; const record = { id: id(), codeHash: hash(code), displayPrefix: code.slice(0, 16), valueMicros: value, maxUses, usedCount: 0, expiresAt: body.expires_at || null, disabledAt: null, createdBy: current.user.id, createdAt: now() }; db.redeemCodes.push(record); dbAudit(current.user, "create_redeem_code", record.id, { value_micros: value, max_uses: maxUses }); persistDatabase(); return sendJson(res, 201, { id: record.id, code, display_prefix: record.displayPrefix, value_micros: value, max_uses: maxUses, expires_at: record.expiresAt }); }
+  if (method === "POST" && pathname === "/api/v1/admin/redeem-codes") { const body = await readBody(req); const value = Number(body.value_micros); const maxUses = Number(body.max_uses || 1); if (!Number.isSafeInteger(value) || value < 1 || value > 1_000_000_000_000 || !Number.isSafeInteger(maxUses) || maxUses < 1 || maxUses > 100_000) throw httpError(400, "兑换码参数无效。", "invalid_redeem_code"); const code = `vv_redeem_${randomToken(18)}`; const record = { id: id(), purpose: "general", codeHash: hash(code), displayPrefix: code.slice(0, 16), valueMicros: value, maxUses, usedCount: 0, expiresAt: body.expires_at || null, disabledAt: null, createdBy: current.user.id, createdAt: now() }; db.redeemCodes.push(record); dbAudit(current.user, "create_redeem_code", record.id, { value_micros: value, max_uses: maxUses, purpose: "general" }); persistDatabase(); return sendJson(res, 201, { id: record.id, code, display_prefix: record.displayPrefix, value_micros: value, max_uses: maxUses, expires_at: record.expiresAt }); }
+  if (method === "POST" && pathname === "/api/v1/admin/redeem-batches") {
+    const body = await readBody(req);
+    const denomination = Number(body.denomination_yuan);
+    const count = body.count === undefined ? CARD_BATCH_COUNT : Number(body.count);
+    if (!CARD_DENOMINATIONS_YUAN.has(denomination)) throw httpError(400, "卡密面额只能是 1、5、10 或 20 元。", "invalid_card_denomination");
+    if (count !== CARD_BATCH_COUNT) throw httpError(400, `每批卡密固定生成 ${CARD_BATCH_COUNT} 张。`, "invalid_card_batch_size");
+    let expiresAt = body.expires_at === undefined || body.expires_at === null || String(body.expires_at).trim() === ""
+      ? null
+      : String(body.expires_at).trim();
+    if (expiresAt && (!Number.isFinite(Date.parse(expiresAt)) || new Date(expiresAt) <= new Date())) throw httpError(400, "卡密有效期必须是未来的有效时间。", "invalid_card_expiry");
+    const batchId = id();
+    const createdAt = now();
+    const valueMicros = denomination * CARD_VALUE_MICROS_PER_YUAN;
+    const existingHashes = new Set(db.redeemCodes.map((value) => value.codeHash));
+    const codes = [];
+    const records = [];
+    while (codes.length < CARD_BATCH_COUNT) {
+      const code = createCardCode(denomination);
+      const codeHash = hash(code);
+      if (existingHashes.has(codeHash)) continue;
+      existingHashes.add(codeHash);
+      codes.push(code);
+      records.push({ id: id(), purpose: "credit", batchId, codeHash, displayPrefix: code.slice(0, 8), valueMicros, denominationYuan: denomination, maxUses: 1, usedCount: 0, expiresAt, disabledAt: null, createdBy: current.user.id, createdAt });
+    }
+    const codesText = codes.join("\n");
+    const batch = { id: batchId, denominationYuan: denomination, valueMicros, codeCount: CARD_BATCH_COUNT, usedCount: 0, expiresAt, disabledAt: null, codesCiphertext: encryptSecret(codesText), createdBy: current.user.id, createdAt };
+    db.redeemCodes.push(...records);
+    db.redeemBatches.push(batch);
+    dbAudit(current.user, "create_redeem_batch", batch.id, { denomination_yuan: denomination, value_micros: valueMicros, code_count: CARD_BATCH_COUNT, expires_at: expiresAt });
+    persistDatabase();
+    return sendJson(res, 201, { batch: publicRedeemBatch(batch), codes, codes_text: codes.join("\n"), download_name: `vivant-valley-${denomination}yuan-${batch.id}.txt`, warning: "卡密明文仅在本次响应中返回；请立即下载并妥善保管。" });
+  }
+  if (method === "GET" && pathname === "/api/v1/admin/redeem-batches") return sendJson(res, 200, { items: db.redeemBatches.slice().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map(publicRedeemBatch) });
+  const redeemBatchCodesMatch = /^\/api\/v1\/admin\/redeem-batches\/([^/]+)\/codes$/.exec(pathname);
+  if (redeemBatchCodesMatch && method === "GET") {
+    const batch = db.redeemBatches.find((value) => value.id === redeemBatchCodesMatch[1]);
+    if (!batch) throw httpError(404, "卡密批次不存在。", "not_found", "not_found_error");
+    if (!batch.codesCiphertext) throw httpError(410, "该批次没有可恢复的卡密明文。", "batch_codes_unavailable", "gone_error");
+    let codesText;
+    try { codesText = decryptSecret(batch.codesCiphertext); } catch { throw httpError(503, "卡密批次明文无法解密。", "batch_codes_unavailable", "server_error"); }
+    return sendJson(res, 200, { batch: publicRedeemBatch(batch), codes_text: codesText, download_name: `vivant-valley-${batch.denominationYuan}yuan-${batch.id}.txt` });
+  }
+  const redeemBatchDisableMatch = /^\/api\/v1\/admin\/redeem-batches\/([^/]+)\/disable$/.exec(pathname);
+  if (redeemBatchDisableMatch && method === "POST") {
+    const batch = db.redeemBatches.find((value) => value.id === redeemBatchDisableMatch[1]);
+    if (!batch) throw httpError(404, "卡密批次不存在。", "not_found", "not_found_error");
+    if (!batch.disabledAt) {
+      batch.disabledAt = now();
+      for (const code of db.redeemCodes) if (code.batchId === batch.id && !code.disabledAt) code.disabledAt = batch.disabledAt;
+      dbAudit(current.user, "disable_redeem_batch", batch.id, {});
+      persistDatabase();
+    }
+    return sendJson(res, 200, publicRedeemBatch(batch));
+  }
   if (method === "GET" && pathname === "/api/v1/admin/usage") { const values = db.requests; return sendJson(res, 200, { from: values[0]?.createdAt || now(), to: now(), requests: values.length, provider_cost_micros: values.reduce((sum, value) => sum + Math.floor((value.chargedMicros || 0) * 0.65), 0), user_charge_micros: values.reduce((sum, value) => sum + (value.chargedMicros || 0), 0), margin_micros: values.reduce((sum, value) => sum + Math.floor((value.chargedMicros || 0) * 0.35), 0) }); }
   if (method === "GET" && pathname === "/api/v1/admin/providers") return sendJson(res, 200, { items: listAdminProviders() });
   if (method === "POST" && pathname === "/api/v1/admin/providers") {
@@ -1104,9 +1205,12 @@ function adminPage() {
 function adminPageWithRuntime() {
   const runtimePanel = `<section class="panel"><h2>运行模式</h2><div class="actions"><label><input id="demoMode" type="checkbox"> 演示模式</label><button id="saveRuntime">保存</button><span id="runtimeState" class="muted"></span></div><p class="muted">开启时不会调用任何真实上游，只返回 Demo 响应；关闭后才会按模型路由调用已配置的供应商。</p></section>`;
   const runtimeScript = `<script>(()=>{const csrf=()=>decodeURIComponent((document.cookie.match(/(?:^|; )vv_csrf=([^;]*)/)||[])[1]||'');const runtimeApi=async(path,opts={})=>{opts.headers={...(opts.headers||{}),'x-csrf-token':csrf()};const r=await fetch(path,opts);const d=r.status===204?null:await r.json();if(!r.ok)throw new Error(d?.error?.message||'请求失败');return d};const state=document.getElementById('runtimeState');const checkbox=document.getElementById('demoMode');const save=document.getElementById('saveRuntime');if(!checkbox||!save)return;const render=(enabled)=>{checkbox.checked=Boolean(enabled);state.textContent=enabled?'当前：演示模式，不调用真实上游':'当前：真实上游已启用'};runtimeApi('/api/v1/admin/settings/runtime').then((d)=>render(d.demo_mode)).catch((error)=>{state.textContent=error.message});save.addEventListener('click',async()=>{save.disabled=true;try{const d=await runtimeApi('/api/v1/admin/settings/runtime',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({demo_mode:checkbox.checked})});render(d.demo_mode);if(typeof show==='function')show(d.demo_mode?'已开启演示模式。':'已关闭演示模式，后续请求将调用真实上游。',true)}catch(error){if(typeof show==='function')show(error.message)}finally{save.disabled=false}})})();</script>`;
+  const batchPanel = `<section class="panel"><h2>卡密批量生成</h2><p class="muted">每次生成固定 100 张一次性卡密。卡密明文只在本次生成结果中显示，请立即下载保存；服务器仅保存哈希。</p><div class="actions"><button type="button" data-card-denomination="1">生成 1 元 × 100</button><button type="button" data-card-denomination="5">生成 5 元 × 100</button><button type="button" data-card-denomination="10">生成 10 元 × 100</button><button type="button" data-card-denomination="20">生成 20 元 × 100</button></div><div id="cardBatchMessage" class="notice hidden"></div><div id="cardBatchResult" class="hidden"><p><strong id="cardBatchSummary"></strong></p><textarea id="cardBatchCodes" rows="12" readonly spellcheck="false" style="width:100%;font-family:monospace"></textarea><div class="actions" style="margin-top:10px"><button id="downloadCardBatch" type="button">下载 TXT</button><button id="copyCardBatch" type="button" class="secondary">复制全部卡密</button></div></div><h3 style="margin-top:24px">已生成批次</h3><div id="cardBatchList"><p class="muted">正在加载...</p></div></section>`;
+  const batchScript = `<script>(()=>{const csrf=()=>decodeURIComponent((document.cookie.match(/(?:^|; )vv_csrf=([^;]*)/)||[])[1]||'');const api=async(path,opts={})=>{opts.headers={...(opts.headers||{}),'x-csrf-token':csrf()};const response=await fetch(path,opts);const data=response.status===204?null:await response.json();if(!response.ok)throw new Error(data?.error?.message||'请求失败');return data};const message=document.getElementById('cardBatchMessage');const result=document.getElementById('cardBatchResult');const summary=document.getElementById('cardBatchSummary');const codes=document.getElementById('cardBatchCodes');const list=document.getElementById('cardBatchList');let downloadName='vivant-valley-card-codes.txt';const show=(text,ok=false)=>{message.textContent=text;message.className='notice '+(ok?'success':'error');message.classList.remove('hidden')};const esc=(value)=>String(value??'').replace(/[&<>"']/g,(char)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));const downloadText=(text,name)=>{const blob=new Blob([text.endsWith('\n')?text:text+'\n'],{type:'text/plain;charset=utf-8'});const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000)};const render=async()=>{try{const data=await api('/api/v1/admin/redeem-batches');if(!data.items.length){list.innerHTML='<p class="muted">暂无批次。</p>';return}list.innerHTML='<table><tr><th>批次</th><th>面额</th><th>数量</th><th>剩余</th><th>状态</th><th>创建时间</th><th>操作</th></tr>'+data.items.map((item)=>'<tr><td><code>'+esc(item.id.slice(0,8))+'...</code></td><td>'+item.denomination_yuan+' 元</td><td>'+item.code_count+'</td><td>'+item.remaining_count+'</td><td>'+(item.disabled?'已停用':'可用')+'</td><td>'+esc(item.created_at)+'</td><td><button type="button" class="secondary" data-download-batch="'+esc(item.id)+'">下载卡密</button> '+(item.disabled||item.remaining_count===0?'':'<button type="button" class="danger" data-disable-batch="'+esc(item.id)+'">停用</button>')+'</td></tr>').join('')+'</table>'}catch(error){list.innerHTML='<p class="error">'+esc(error.message)+'</p>'}};const setBusy=(busy)=>document.querySelectorAll('[data-card-denomination]').forEach((button)=>{button.disabled=busy});document.querySelectorAll('[data-card-denomination]').forEach((button)=>button.addEventListener('click',async()=>{const denomination=Number(button.dataset.cardDenomination);setBusy(true);try{const data=await api('/api/v1/admin/redeem-batches',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({denomination_yuan:denomination})});codes.value=data.codes_text;downloadName=data.download_name;summary.textContent=denomination+' 元批次已生成：'+data.codes.length+' 张';result.classList.remove('hidden');show('卡密已生成，请立即下载并保存。',true);downloadText(data.codes_text,data.download_name);render()}catch(error){show(error.message)}finally{setBusy(false)}}));document.getElementById('downloadCardBatch')?.addEventListener('click',()=>downloadText(codes.value,downloadName));document.getElementById('copyCardBatch')?.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(codes.value);show('卡密已复制。',true)}catch{show('浏览器不允许自动复制，请手动复制文本。')}});document.addEventListener('click',async(event)=>{const download=event.target.closest('[data-download-batch]');if(download){download.disabled=true;try{const data=await api('/api/v1/admin/redeem-batches/'+encodeURIComponent(download.dataset.downloadBatch)+'/codes');downloadText(data.codes_text,data.download_name);show('卡密已下载。',true)}catch(error){show(error.message)}finally{download.disabled=false}return}const button=event.target.closest('[data-disable-batch]');if(!button)return;if(!window.confirm('停用该批次后，剩余卡密将无法兑换，确定继续吗？'))return;button.disabled=true;try{await api('/api/v1/admin/redeem-batches/'+encodeURIComponent(button.dataset.disableBatch)+'/disable',{method:'POST'});show('批次已停用。',true);render()}catch(error){show(error.message)}finally{button.disabled=false}});render()})();</script>`;
   return adminPage()
     .replace('<section class="panel"><h2>上游供应商</h2>', `${runtimePanel}<section class="panel"><h2>上游供应商</h2>`)
-    .replace('</body>', `${runtimeScript}</body>`);
+    .replace('</main>', `${batchPanel}</main>`)
+    .replace('</body>', `${runtimeScript}${batchScript}</body>`);
 }
 
 function web(req, res, url) {
