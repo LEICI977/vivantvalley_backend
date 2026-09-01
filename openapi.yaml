@@ -792,7 +792,7 @@ paths:
     post:
       tags: [Admin]
       operationId: adminTestProvider
-      summary: Probe an upstream models endpoint without a billable chat call
+      summary: Probe upstream Chat Completions and forced tool-call compatibility
       security:
         - SessionCookie: []
       parameters:
@@ -803,7 +803,7 @@ paths:
         - $ref: '#/components/parameters/CsrfToken'
       responses:
         '200':
-          description: Provider probe succeeded
+          description: Provider returned a valid forced tool call; this probe may consume a small number of upstream tokens
         '401': { $ref: '#/components/responses/AuthError' }
         '403': { $ref: '#/components/responses/ForbiddenError' }
         '404': { $ref: '#/components/responses/NotFoundError' }

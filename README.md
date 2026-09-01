@@ -105,7 +105,7 @@ Provider management endpoints are admin-only:
 GET    /api/v1/admin/providers
 POST   /api/v1/admin/providers
 PATCH  /api/v1/admin/providers/{id}
-POST   /api/v1/admin/providers/{id}/test
+POST   /api/v1/admin/providers/{id}/test  # small real tool-call compatibility probe
 DELETE /api/v1/admin/providers/{id}
 ```
 

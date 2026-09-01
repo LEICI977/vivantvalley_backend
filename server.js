@@ -215,14 +215,6 @@ function resolveEndpoint(base) {
   return parsed;
 }
 
-function resolveModelsEndpoint(base) {
-  const parsed = new URL(base);
-  let pathname = parsed.pathname.replace(/\/+$/, "");
-  if (pathname.toLowerCase().endsWith("/chat/completions")) pathname = pathname.slice(0, -"/chat/completions".length);
-  parsed.pathname = `${pathname}/models`;
-  return parsed;
-}
-
 function validateManagedBaseUrl(base) {
   let parsed;
   try { parsed = new URL(base); } catch { throw new Error("invalid provider URL"); }
@@ -293,22 +285,76 @@ function demoModeEnabled() {
 
 async function probeProvider(provider) {
   let endpoint;
-  try { endpoint = resolveModelsEndpoint(provider.baseUrl); } catch { throw httpError(400, "上游地址无效。", "invalid_provider_url"); }
+  try { endpoint = resolveEndpoint(provider.baseUrl); } catch { throw httpError(400, "上游地址无效。", "invalid_provider_url"); }
   let apiKey;
   try { apiKey = decryptSecret(provider.apiKeyCiphertext); } catch { throw httpError(503, "上游密钥不可用。", "provider_secret_invalid", "upstream_error"); }
+  const boundAlias = db.modelAliases.find((value) => value.enabled && value.providerId === provider.id && String(value.providerModel || "").trim());
+  const model = String(boundAlias?.providerModel || provider.defaultModel || "").trim();
+  if (!model) throw httpError(400, "请先填写默认模型，或将一个已填写上游模型的模型别名绑定到该供应商。", "provider_model_required");
+  const probeToolName = "vivant_valley_probe";
+  const payload = {
+    model,
+    messages: [{ role: "user", content: "Call vivant_valley_probe with ok=true." }],
+    tools: [{
+      type: "function",
+      function: {
+        name: probeToolName,
+        description: "Verify OpenAI-compatible tool calling.",
+        parameters: {
+          type: "object",
+          properties: { ok: { type: "boolean", enum: [true] } },
+          required: ["ok"],
+          additionalProperties: false,
+        },
+      },
+    }],
+    tool_choice: { type: "function", function: { name: probeToolName } },
+    stream: false,
+    max_tokens: 64,
+  };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.min(config.requestTimeoutMs, 15_000));
   try {
-    const response = await fetch(endpoint, { headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" }, signal: controller.signal });
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiKey}`, accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
     const text = await response.text();
-    if (!response.ok) throw httpError(502, `上游返回 HTTP ${response.status}。`, "provider_check_failed", "upstream_error");
-    return { status: response.status, bodyBytes: Buffer.byteLength(text) };
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { throw invalidUpstreamJsonError(response, "provider_check_invalid_response"); }
+    if (!response.ok) throw httpError(502, `上游返回 HTTP ${response.status}：${upstreamErrorMessage(parsed, "模型调用失败。")}`, "provider_check_failed", "upstream_error");
+    const message = parsed?.choices?.[0]?.message;
+    const call = Array.isArray(message?.tool_calls)
+      ? message.tool_calls.find((value) => value?.function?.name === probeToolName)
+      : null;
+    if (!call) throw httpError(502, "上游虽然返回了 JSON，但没有按要求返回工具调用；当前模型不兼容 Mod 对话协议。", "provider_tool_call_unsupported", "upstream_error");
+    const rawArguments = call.function.arguments;
+    let argumentsValue;
+    try { argumentsValue = typeof rawArguments === "string" ? JSON.parse(rawArguments) : rawArguments; } catch { throw httpError(502, "上游工具调用 arguments 不是有效 JSON。", "provider_tool_arguments_invalid", "upstream_error"); }
+    if (!argumentsValue || argumentsValue.ok !== true) throw httpError(502, "上游工具调用没有返回有效的探测参数。", "provider_tool_arguments_invalid", "upstream_error");
+    return { status: response.status, bodyBytes: Buffer.byteLength(text), model, protocol: "chat_completions_tool_call" };
   } catch (error) {
     if (error.status) throw error;
     throw httpError(error.name === "AbortError" ? 408 : 502, error.name === "AbortError" ? "上游检测超时。" : "无法连接上游。", error.name === "AbortError" ? "provider_check_timeout" : "provider_unreachable", "upstream_error");
   } finally {
     clearTimeout(timer);
   }
+}
+
+function upstreamErrorMessage(parsed, fallback) {
+  const message = parsed?.error?.message;
+  return typeof message === "string" && message.trim() ? message.trim().slice(0, 500) : fallback;
+}
+
+function invalidUpstreamJsonError(response, code = "invalid_upstream_response") {
+  const contentType = String(response.headers.get("content-type") || "未提供").split(";", 1)[0].trim().slice(0, 80) || "未提供";
+  return httpError(
+    502,
+    `上游返回 HTTP ${response.status}，响应不是有效 JSON（Content-Type: ${contentType}）。请检查 Base URL、API Key 和上游网关状态。`,
+    code,
+    "upstream_error");
 }
 
 function parseCookies(req) {
@@ -627,8 +673,8 @@ async function upstreamCompletion(body, alias, requestIdValue) {
     const response = await fetch(upstream.endpoint, { method: "POST", headers: { authorization: `Bearer ${upstream.apiKey}`, accept: "application/json", "content-type": "application/json", "x-request-id": requestIdValue }, body: JSON.stringify(payload), signal: controller.signal });
     const text = await response.text();
     let parsed;
-    try { parsed = JSON.parse(text); } catch { throw httpError(502, "上游返回了无效 JSON。", "invalid_upstream_response", "upstream_error"); }
-    if (!response.ok) throw httpError(response.status === 429 ? 429 : 502, parsed.error?.message || "上游模型请求失败。", response.status === 429 ? "upstream_rate_limited" : "upstream_error", "upstream_error");
+    try { parsed = JSON.parse(text); } catch { throw invalidUpstreamJsonError(response); }
+    if (!response.ok) throw httpError(response.status === 429 ? 429 : 502, `上游返回 HTTP ${response.status}：${upstreamErrorMessage(parsed, "模型请求失败。")}`, response.status === 429 ? "upstream_rate_limited" : "upstream_error", "upstream_error");
     return normalizeResponse(parsed, alias, requestIdValue);
   } catch (error) {
     if (error.status) throw error;
@@ -917,7 +963,7 @@ async function adminApi(req, res, url) {
     try {
       const result = await probeProvider(provider);
       provider.lastCheckedAt = now(); provider.lastCheckStatus = "ok"; provider.updatedAt = now(); persistDatabase();
-      return sendJson(res, 200, { ok: true, status: result.status, body_bytes: result.bodyBytes, checked_at: provider.lastCheckedAt });
+      return sendJson(res, 200, { ok: true, status: result.status, body_bytes: result.bodyBytes, model: result.model, protocol: result.protocol, checked_at: provider.lastCheckedAt });
     } catch (error) {
       provider.lastCheckedAt = now(); provider.lastCheckStatus = "failed"; provider.updatedAt = now(); persistDatabase(); throw error;
     }

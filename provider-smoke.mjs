@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "vivant-valley-provider-") );
 const backendPort = 19091;
@@ -18,20 +19,29 @@ try {
       res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
       return res.end(body);
     }
+    if (req.method === "POST" && req.url === "/bad/chat/completions") {
+      res.writeHead(403, { "content-type": "text/html; charset=utf-8" });
+      return res.end("<html><body>access denied</body></html>");
+    }
     if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
       res.writeHead(404); return res.end();
     }
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    upstreamCalls.push({ authorization: req.headers.authorization, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
-    const body = JSON.stringify({ id: "fake-completion", object: "chat.completion", model: "fake-model", choices: [{ index: 0, message: { role: "assistant", content: "provider-ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } });
+    const requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    upstreamCalls.push({ authorization: req.headers.authorization, body: requestBody });
+    const requestedTool = requestBody.tool_choice?.function?.name;
+    const message = requestedTool
+      ? { role: "assistant", content: null, tool_calls: [{ id: "call_probe", type: "function", function: { name: requestedTool, arguments: JSON.stringify({ ok: true }) } }] }
+      : { role: "assistant", content: "provider-ok" };
+    const body = JSON.stringify({ id: "fake-completion", object: "chat.completion", model: "fake-model", choices: [{ index: 0, message, finish_reason: requestedTool ? "tool_calls" : "stop" }], usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } });
     res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
     res.end(body);
   });
   await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const upstreamPort = upstream.address().port;
   child = spawn(process.execPath, ["server.js"], {
-    cwd: path.dirname(new URL(import.meta.url).pathname),
+    cwd: path.dirname(fileURLToPath(import.meta.url)),
     env: { ...process.env, PORT: String(backendPort), HOST: "127.0.0.1", DATA_FILE: path.join(temp, "db.json"), DEMO_MODE: "false", UPSTREAM_API_KEY: "", ADMIN_EMAIL: "admin@example.com", ADMIN_PASSWORD: "admin-password-123", ADMIN_PAGE_PASSWORD: "", BACKEND_PEPPER: "provider-smoke-pepper" },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -53,14 +63,34 @@ try {
   assert.equal(topup.status, 200);
   const provider = await request("/api/v1/admin/providers", { method: "POST", cookies: admin.cookies, csrf: adminCsrf, body: { name: "Local fake upstream", base_url: `http://127.0.0.1:${upstreamPort}/v1`, default_model: "fake-model", api_key: "fake-provider-secret" } });
   assert.equal(provider.status, 201);
+  const providerProbe = await request(`/api/v1/admin/providers/${provider.data.id}/test`, { method: "POST", cookies: admin.cookies, csrf: adminCsrf });
+  assert.equal(providerProbe.status, 200, JSON.stringify(providerProbe.data));
+  assert.equal(providerProbe.data.model, "fake-model");
+  assert.equal(providerProbe.data.protocol, "chat_completions_tool_call");
+  assert.equal(upstreamCalls[0].body.tool_choice.function.name, "vivant_valley_probe");
   const route = await request("/api/v1/admin/models/vv-dialogue", { method: "PATCH", cookies: admin.cookies, csrf: adminCsrf, body: { providerId: provider.data.id, providerModel: "fake-model" } });
   assert.equal(route.status, 200);
   const completion = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}` }, body: { model: "vv-dialogue", messages: [{ role: "user", content: "hello" }], max_tokens: 64 } });
   assert.equal(completion.status, 200, JSON.stringify(completion.data));
   assert.equal(completion.data.choices[0].message.content, "provider-ok");
-  assert.equal(upstreamCalls.length, 1);
-  assert.equal(upstreamCalls[0].authorization, "Bearer fake-provider-secret");
-  assert.equal(upstreamCalls[0].body.model, "fake-model");
+  assert.equal(upstreamCalls.length, 2);
+  assert.equal(upstreamCalls[1].authorization, "Bearer fake-provider-secret");
+  assert.equal(upstreamCalls[1].body.model, "fake-model");
+
+  const badProvider = await request("/api/v1/admin/providers", { method: "POST", cookies: admin.cookies, csrf: adminCsrf, body: { name: "HTML error upstream", base_url: `http://127.0.0.1:${upstreamPort}/bad`, default_model: "fake-model", api_key: "fake-provider-secret" } });
+  assert.equal(badProvider.status, 201);
+  const badProbe = await request(`/api/v1/admin/providers/${badProvider.data.id}/test`, { method: "POST", cookies: admin.cookies, csrf: adminCsrf });
+  assert.equal(badProbe.status, 502);
+  assert.equal(badProbe.data.error.code, "provider_check_invalid_response");
+  assert.match(badProbe.data.error.message, /HTTP 403/);
+  assert.match(badProbe.data.error.message, /text\/html/);
+  const badRoute = await request("/api/v1/admin/models/vv-fast", { method: "PATCH", cookies: admin.cookies, csrf: adminCsrf, body: { providerId: badProvider.data.id, providerModel: "fake-model" } });
+  assert.equal(badRoute.status, 200);
+  const badCompletion = await request("/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key.data.key}` }, body: { model: "vv-fast", messages: [{ role: "user", content: "hello" }], max_tokens: 64 } });
+  assert.equal(badCompletion.status, 502);
+  assert.equal(badCompletion.data.error.code, "invalid_upstream_response");
+  assert.match(badCompletion.data.error.message, /HTTP 403/);
+  assert.match(badCompletion.data.error.message, /text\/html/);
   console.log("managed provider routing smoke checks passed");
 } catch (error) {
   console.error(error);
